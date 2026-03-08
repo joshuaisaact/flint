@@ -163,9 +163,11 @@ Priority order optimized for AI agent code execution sandbox use case:
 
 1. ~~**vsock (virtio-socket)**~~ -- DONE (Phase 4a)
 
-2. **VM snapshotting / restore** -- save full VM state (memory + device + vCPU registers)
-   to disk, restore in ~5ms. Enables pre-booted "warm" VMs: boot once, snapshot after
-   init, restore copies on demand. Key to <50ms cold start for sandbox instances.
+2. ~~**VM snapshotting / restore**~~ -- DONE. Save full VM state (vCPU registers, interrupt
+   controllers, device transport state, serial) to binary vmstate file + raw memory file.
+   Restore via mmap(MAP_PRIVATE) demand-paging for near-instant restore regardless of VM
+   size. CLI: `--save-on-halt`, `--restore`, `--vmstate-path`, `--mem-path`.
+   API endpoints (pause/resume, snapshot create/load) still TODO.
 
 3. **VM pool / warm start** -- pre-fork a pool of restored VMs ready for immediate use.
    Combined with snapshots, this gives near-instant sandbox provisioning.
