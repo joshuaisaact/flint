@@ -71,6 +71,7 @@ src/
     virtio/
       mmio.zig      -- virtio-mmio v2 transport layer
       blk.zig       -- virtio-blk device backend
+      net.zig       -- virtio-net device backend (TAP)
       queue.zig     -- split virtqueue (desc table, avail/used rings)
 ```
 
@@ -121,11 +122,20 @@ src/
   queue size validation (power-of-2), bounded avail ring processing, O_CLOEXEC on all fds
 - **Result: guest mounts ext4 disk images via /dev/vda, reads/writes/flushes work correctly**
 
-### Phase 3b: Networking -- NEXT
-- virtio-net device (backed by TAP device)
+### Phase 3b: Networking -- DONE
+- virtio-net device backend with TAP device (IFF_TAP | IFF_NO_PI | IFF_VNET_HDR)
+- Multiple virtqueue support (RX + TX queues)
+- Non-blocking RX polling via readv between VM exits
+- TX via writev scatter-gather on TAP fd
+- Locally-administered MAC address generation from TAP name
+- virtio_net_hdr_v1 (12 bytes) with TUNSETVNETHDRSZ
+- Multi-device MMIO support: tagged union dispatch, per-device IRQ/MMIO slots
+- Explicit CLI flags: `--disk <path>`, `--tap <name>`
+- **Result: virtio-net initializes TAP, handles TX/RX frames between guest and host**
+
+#### Future networking enhancements (Phase 4)
 - vhost-net kernel acceleration
 - `ioeventfd`/`irqfd` for kernel-bypass notifications
-- Multiple virtqueue support (RX + TX queues)
 
 ### Phase 4: Production concerns
 - REST API server (Unix socket, JSON)
