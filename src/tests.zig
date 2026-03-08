@@ -302,3 +302,53 @@ test "snapshot: header version validation" {
     std.mem.writeInt(u32, buf[16..20], 99, .little);
     try std.testing.expectError(error.InvalidSnapshot, snapshot.readHeader(buf));
 }
+
+// -- Pool tests --
+
+const pool_mod = @import("pool.zig");
+
+test "pool: acquire and release lifecycle" {
+    var pool = pool_mod.Pool.init(.{
+        .pool_size = 2,
+        .vmstate_path = "test.vmstate",
+        .mem_path = "test.mem",
+        .pool_sock = "/tmp/test-pool.sock",
+        .self_exe = "flint",
+    });
+
+    // No slots are ready initially (they're empty, not spawned)
+    try std.testing.expect(pool.acquire() == null);
+
+    // Manually set a slot to ready (simulates a spawned VM)
+    pool.slots[0].state = .ready;
+    pool.slots[0].pid = 12345;
+
+    // Acquire should return slot 0
+    const id = pool.acquire().?;
+    try std.testing.expectEqual(@as(u16, 0), id);
+    try std.testing.expectEqual(pool_mod.SlotState.in_use, pool.slots[0].state);
+
+    // Second acquire should fail (only slot 0 was ready)
+    try std.testing.expect(pool.acquire() == null);
+}
+
+test "pool: status counts" {
+    var pool = pool_mod.Pool.init(.{
+        .pool_size = 4,
+        .vmstate_path = "test.vmstate",
+        .mem_path = "test.mem",
+        .pool_sock = "/tmp/test-pool.sock",
+        .self_exe = "flint",
+    });
+
+    pool.slots[0].state = .ready;
+    pool.slots[1].state = .starting;
+    pool.slots[2].state = .in_use;
+    pool.slots[3].state = .failed;
+
+    const s = pool.status();
+    try std.testing.expectEqual(@as(u16, 1), s.ready);
+    try std.testing.expectEqual(@as(u16, 1), s.starting);
+    try std.testing.expectEqual(@as(u16, 1), s.in_use);
+    try std.testing.expectEqual(@as(u16, 1), s.failed);
+}

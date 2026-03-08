@@ -14,6 +14,8 @@ const api = @import("api.zig");
 const snapshot = @import("snapshot.zig");
 const jail = @import("jail.zig");
 const seccomp = @import("seccomp.zig");
+const pool_mod = @import("pool.zig");
+const pool_api = @import("pool_api.zig");
 
 const log = std.log.scoped(.flint);
 
@@ -53,9 +55,11 @@ const DEFAULT_CMDLINE = "earlyprintk=serial,ttyS0,115200 console=ttyS0 nokaslr r
 
 pub fn main(init: std.process.Init) !void {
     var args = std.process.Args.Iterator.init(init.minimal.args);
-    _ = args.skip(); // program name
+    const self_exe = args.next() orelse "flint";
 
-    // Check for API mode or CLI mode
+    var pool_mode = false;
+    var pool_size: u16 = 4;
+    var pool_sock: [*:0]const u8 = "/tmp/flint-pool.sock";
     var api_sock: ?[*:0]const u8 = null;
     var kernel_path: ?[*:0]const u8 = null;
     var initrd_path: ?[*:0]const u8 = null;
@@ -139,6 +143,27 @@ pub fn main(init: std.process.Init) !void {
             };
         } else if (std.mem.eql(u8, s, "--seccomp-audit")) {
             seccomp_audit = true;
+        } else if (std.mem.eql(u8, s, "pool")) {
+            pool_mode = true;
+        } else if (std.mem.eql(u8, s, "--pool-size")) {
+            const ps = args.next() orelse {
+                std.debug.print("--pool-size requires an argument\n", .{});
+                std.process.exit(1);
+            };
+            const ps_len = std.mem.indexOfSentinel(u8, 0, ps);
+            pool_size = std.fmt.parseUnsigned(u16, ps[0..ps_len], 10) catch {
+                std.debug.print("invalid --pool-size\n", .{});
+                std.process.exit(1);
+            };
+            if (pool_size == 0 or pool_size > pool_mod.MAX_POOL_SIZE) {
+                std.debug.print("--pool-size must be 1-{}\n", .{pool_mod.MAX_POOL_SIZE});
+                std.process.exit(1);
+            }
+        } else if (std.mem.eql(u8, s, "--pool-sock")) {
+            pool_sock = args.next() orelse {
+                std.debug.print("--pool-sock requires an argument\n", .{});
+                std.process.exit(1);
+            };
         } else if (std.mem.indexOfScalar(u8, s, '=') != null) {
             cmdline = arg;
         } else if (kernel_path == null) {
@@ -147,6 +172,23 @@ pub fn main(init: std.process.Init) !void {
             initrd_path = arg;
             got_initrd = true;
         }
+    }
+
+    // Pool mode: manager process spawns child VMs, no jail/seccomp for itself
+    if (pool_mode) {
+        var pool = pool_mod.Pool.init(.{
+            .pool_size = pool_size,
+            .vmstate_path = vmstate_path,
+            .mem_path = mem_snap_path,
+            .disk_path = disk_path,
+            .pool_sock = pool_sock,
+            .self_exe = self_exe,
+            .jail_dir = jail_dir,
+            .jail_uid = jail_uid,
+            .jail_gid = jail_gid,
+        });
+        defer pool.shutdown();
+        return pool_api.serve(&pool, init.io);
     }
 
     // Jail setup runs before anything else — after this, the process is
@@ -190,7 +232,13 @@ pub fn main(init: std.process.Init) !void {
         try seccomp.install(seccomp_audit);
     }
 
-    if (restore_mode) {
+    if (restore_mode and api_sock != null) {
+        // Restore + API mode: restore from snapshot, then run post-boot API
+        // (used by pool manager to spawn controllable child VMs)
+        const sock = api_sock.?;
+        const sock_len = std.mem.indexOfSentinel(u8, 0, sock);
+        try restoreVmWithApi(vmstate_path, mem_snap_path, disk_path, tap_name, vsock_cid, vsock_uds, sock[0..sock_len], init.io, init.gpa);
+    } else if (restore_mode) {
         // Restore mode: rebuild VM from snapshot files, no kernel load
         try restoreVm(vmstate_path, mem_snap_path, disk_path, tap_name, vsock_cid, vsock_uds);
     } else if (api_sock) |sock| {
@@ -218,9 +266,11 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("       flint --api-sock <path>\n", .{});
         std.debug.print("       --jail <dir> --jail-uid <uid> --jail-gid <gid> [--jail-cgroup <name>]\n", .{});
         std.debug.print("       --seccomp-audit  (log violations instead of killing)\n", .{});
+        std.debug.print("       flint pool --vmstate-path <p> --mem-path <p> --pool-size <n> --pool-sock <p>\n", .{});
         std.process.exit(1);
     }
 }
+
 
 /// All live VM components created during setup. Returned by createVmComponents
 /// so callers own the resources and their lifetimes.
@@ -458,6 +508,72 @@ fn restoreVm(
     // 6. Enter run loop — guest resumes execution from where it was paused
     log.info("entering VM run loop (restored)", .{});
     try runLoop(&vcpu, &serial, &vm, &mem, &devices, device_count, .{}, null);
+}
+
+/// Restore a VM from snapshot and run a post-boot API server.
+/// Used by pool manager children: the VM runs in a thread while the main
+/// thread handles API requests (pause/resume/snapshot/status).
+fn restoreVmWithApi(
+    vmstate_path: [*:0]const u8,
+    mem_snap_path: [*:0]const u8,
+    disk_path: ?[*:0]const u8,
+    tap_name: ?[*:0]const u8,
+    vsock_cid_str: ?[*:0]const u8,
+    vsock_uds_path: ?[*:0]const u8,
+    api_sock_path: []const u8,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+) !void {
+    log.info("flint restoring from snapshot (API mode)", .{});
+
+    const kvm = try Kvm.open();
+    defer kvm.deinit();
+
+    const vm = try kvm.createVm();
+    defer vm.deinit();
+
+    try vm.setTssAddr(0xFFFBD000);
+    try vm.setIdentityMapAddr(0xFFFBC000);
+    try vm.createIrqChip();
+    try vm.createPit2();
+
+    var devices: [virtio.MAX_DEVICES]?VirtioMmio = .{null} ** virtio.MAX_DEVICES;
+    var device_count = try initDevices(&devices, disk_path, tap_name, vsock_cid_str, vsock_uds_path);
+    defer for (&devices) |*d| {
+        if (d.*) |*dev| dev.deinit();
+    };
+
+    const vcpu_mmap_size = try kvm.getVcpuMmapSize();
+    var vcpu = try vm.createVcpu(0, vcpu_mmap_size);
+    defer vcpu.deinit();
+
+    var serial = Serial.init(1);
+    var mem = try snapshot.load(vmstate_path, mem_snap_path, &vcpu, &vm, &serial, &devices, &device_count);
+    defer mem.deinit();
+
+    try vm.setMemoryRegion(0, 0, mem.alignedMem());
+
+    var runtime = VmRuntime{
+        .vcpu = &vcpu,
+        .vm = &vm,
+        .mem = &mem,
+        .serial = &serial,
+        .devices = &devices,
+        .device_count = device_count,
+        .snap_opts = .{},
+    };
+
+    log.info("entering VM run loop (restored, API mode)", .{});
+    const thread = std.Thread.spawn(.{}, runLoopThread, .{&runtime}) catch |err| {
+        log.err("failed to spawn run loop thread: {}", .{err});
+        return error.ThreadSpawnFailed;
+    };
+
+    api.servePostBoot(api_sock_path, io, allocator, &runtime) catch |err| {
+        log.err("post-boot API error: {}", .{err});
+    };
+
+    thread.join();
 }
 
 // Memory layout for boot structures (all below boot_params at 0x7000)

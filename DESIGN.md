@@ -54,6 +54,8 @@ src/
   snapshot.zig      -- VM state save/load orchestrator
   jail.zig          -- mount namespace, pivot_root, cgroup, privilege drop
   seccomp.zig       -- BPF syscall filter (comptime-generated whitelist)
+  pool.zig          -- VM pool manager (process-per-VM, fork+exec)
+  pool_api.zig      -- pool REST API (acquire/release/status)
   memory.zig        -- guest physical memory management (mmap regions)
   tests.zig         -- unit tests
   kvm/
@@ -173,8 +175,11 @@ Priority order optimized for AI agent code execution sandbox use case:
    Post-boot API: PATCH /vm (pause/resume), PUT /snapshot/create, GET /vm.
    VmRuntime struct with atomic pause via `kvm_run.immediate_exit`.
 
-3. **VM pool / warm start** -- pre-fork a pool of restored VMs ready for immediate use.
-   Combined with snapshots, this gives near-instant sandbox provisioning.
+3. ~~**VM pool / warm start**~~ -- DONE. `flint pool` mode: pool manager spawns child
+   Flint processes in `--restore` mode, each with its own API socket. REST API for
+   acquire/release/status on the pool socket. Process-per-VM isolation, eager
+   replenishment on release (kill and replace, no recycling). Health check via
+   socket probe. CLI: `--pool-size`, `--pool-sock`, `--vmstate-path`, `--mem-path`.
 
 4. ~~**Seccomp + jailer**~~ -- DONE. In-process `--jail` flag: mount namespace +
    pivot_root for filesystem isolation, device node creation (/dev/kvm, /dev/net/tun),
