@@ -10,22 +10,20 @@ const virtio = @import("devices/virtio.zig");
 const abi = @import("kvm/abi.zig");
 const c = abi.c;
 const boot_params = @import("boot/params.zig");
+const api = @import("api.zig");
 
 const log = std.log.scoped(.flint);
 
 const DEFAULT_MEM_SIZE = 512 * 1024 * 1024; // 512 MB
 const DEFAULT_CMDLINE = "earlyprintk=serial,ttyS0,115200 console=ttyS0 nokaslr reboot=k panic=1 pci=off nomodules";
 
-pub fn main(init: std.process.Init.Minimal) !void {
-    var args = std.process.Args.Iterator.init(init.args);
+pub fn main(init: std.process.Init) !void {
+    var args = std.process.Args.Iterator.init(init.minimal.args);
     _ = args.skip(); // program name
 
-    const kernel_path = args.next() orelse {
-        std.debug.print("usage: flint <kernel> [initrd] [--disk <path>] [--tap <name>] [cmdline]\n", .{});
-        std.process.exit(1);
-    };
-
-    // Parse remaining args
+    // Check for API mode or CLI mode
+    var api_sock: ?[*:0]const u8 = null;
+    var kernel_path: ?[*:0]const u8 = null;
     var initrd_path: ?[*:0]const u8 = null;
     var disk_path: ?[*:0]const u8 = null;
     var tap_name: ?[*:0]const u8 = null;
@@ -35,7 +33,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
     while (args.next()) |arg| {
         const len = std.mem.indexOfSentinel(u8, 0, arg);
         const s = arg[0..len];
-        if (std.mem.eql(u8, s, "--disk")) {
+        if (std.mem.eql(u8, s, "--api-sock")) {
+            api_sock = args.next() orelse {
+                std.debug.print("--api-sock requires an argument\n", .{});
+                std.process.exit(1);
+            };
+        } else if (std.mem.eql(u8, s, "--disk")) {
             disk_path = args.next() orelse {
                 std.debug.print("--disk requires an argument\n", .{});
                 std.process.exit(1);
@@ -47,11 +50,44 @@ pub fn main(init: std.process.Init.Minimal) !void {
             };
         } else if (std.mem.indexOfScalar(u8, s, '=') != null) {
             cmdline = arg;
+        } else if (kernel_path == null) {
+            kernel_path = arg;
         } else if (!got_initrd) {
             initrd_path = arg;
             got_initrd = true;
         }
     }
+
+    if (api_sock) |sock| {
+        // API mode: listen for configuration, then boot
+        const sock_len = std.mem.indexOfSentinel(u8, 0, sock);
+        const config = try api.serve(sock[0..sock_len], init.io, init.gpa);
+        const kp: [*:0]const u8 = config.kernel_path.?.ptr;
+        const ip: ?[*:0]const u8 = if (config.initrd_path) |p| p.ptr else null;
+        const ba: ?[*:0]const u8 = if (config.boot_args) |p| p.ptr else null;
+        const dp: ?[*:0]const u8 = if (config.disk_path) |p| p.ptr else null;
+        const tn: ?[*:0]const u8 = if (config.tap_name) |p| p.ptr else null;
+        try bootVm(kp, ip, ba, dp, tn, config.mem_size_mib);
+    } else if (kernel_path) |kp| {
+        // CLI mode: boot directly from args
+        try bootVm(kp, initrd_path, cmdline, disk_path, tap_name, DEFAULT_MEM_SIZE / (1024 * 1024));
+    } else {
+        std.debug.print("usage: flint <kernel> [initrd] [--disk <path>] [--tap <name>] [cmdline]\n", .{});
+        std.debug.print("       flint --api-sock <path>\n", .{});
+        std.process.exit(1);
+    }
+}
+
+fn bootVm(
+    kernel_path: [*:0]const u8,
+    initrd_path: ?[*:0]const u8,
+    cmdline_or_args: ?[*:0]const u8,
+    disk_path: ?[*:0]const u8,
+    tap_name: ?[*:0]const u8,
+    mem_size_mib: u32,
+) !void {
+    const mem_size: usize = @as(usize, mem_size_mib) * 1024 * 1024;
+    const cmdline: [*:0]const u8 = cmdline_or_args orelse DEFAULT_CMDLINE;
 
     log.info("flint starting", .{});
     log.info("kernel: {s}", .{kernel_path});
@@ -59,6 +95,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     if (disk_path) |p| log.info("disk: {s}", .{p});
     if (tap_name) |p| log.info("tap: {s}", .{p});
     log.info("cmdline: {s}", .{cmdline});
+    log.info("memory: {} MB", .{mem_size_mib});
 
     // 1. Open KVM
     const kvm = try Kvm.open();
@@ -73,7 +110,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     try vm.setIdentityMapAddr(0xFFFBC000);
 
     // 4. Set up guest memory
-    var mem = try Memory.init(DEFAULT_MEM_SIZE);
+    var mem = try Memory.init(mem_size);
     defer mem.deinit();
 
     try vm.setMemoryRegion(0, 0, mem.alignedMem());

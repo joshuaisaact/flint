@@ -1,6 +1,6 @@
-# Flint: Firecracker in Zig
+# Flint
 
-A lightweight, production-grade Virtual Machine Monitor (VMM) using KVM, written in Zig.
+A lightweight KVM-based Virtual Machine Monitor (VMM) written in Zig, designed for fast, secure code execution sandboxes.
 
 ## Prior art
 
@@ -50,6 +50,7 @@ A lightweight, production-grade Virtual Machine Monitor (VMM) using KVM, written
 ```
 src/
   main.zig          -- entry point, arg parsing, register setup, run loop
+  api.zig           -- REST API server (Unix socket, HTTP/1.1, JSON)
   memory.zig        -- guest physical memory management (mmap regions)
   tests.zig         -- unit tests
   kvm/
@@ -60,11 +61,6 @@ src/
   boot/
     params.zig      -- boot protocol constants and packed structs
     loader.zig      -- bzImage + initrd loading into guest memory
-  devices/
-    serial.zig      -- 16550 UART emulation (COM1, IRQ 4)
-```
-
-```
   devices/
     serial.zig      -- 16550 UART emulation (COM1, IRQ 4)
     virtio.zig      -- virtio common constants (MMIO offsets, status, features)
@@ -133,31 +129,60 @@ src/
 - Explicit CLI flags: `--disk <path>`, `--tap <name>`
 - **Result: virtio-net initializes TAP, handles TX/RX frames between guest and host**
 
-#### Future networking enhancements (Phase 4)
-- vhost-net kernel acceleration
-- `ioeventfd`/`irqfd` for kernel-bypass notifications
+### Phase 3c: REST API -- DONE
+- Unix domain socket HTTP/1.1 server using Zig stdlib (std.Io, std.http.Server, std.json)
+- Firecracker-compatible pre-boot configuration endpoints:
+  - PUT /boot-source (kernel_image_path, initrd_path, boot_args)
+  - PUT /drives/{id} (path_on_host)
+  - PUT /network-interfaces/{id} (host_dev_name)
+  - PUT /machine-config (mem_size_mib)
+  - GET /machine-config
+  - PUT /actions (InstanceStart)
+- Two-phase lifecycle: configure via API, then InstanceStart triggers boot
+- Both CLI and API boot modes supported (`--api-sock <path>` flag)
+- **Result: full VM configuration and boot via curl against Unix socket**
 
-### Phase 4: Production concerns
-- REST API server (Unix socket, JSON)
-- Seccomp filters
-- Jailer (namespaces, cgroups)
-- Rate limiters on virtio devices
-- VM snapshotting / restore
-- vsock support
-- Metrics / logging
-- CPUID filtering (topology, HYPERVISOR bit, VMX/SMX)
+### Phase 4: Sandbox runtime (in progress)
+
+Priority order optimized for AI agent code execution sandbox use case:
+
+1. **vsock (virtio-socket)** -- host↔guest communication without IP networking.
+   Enables the host to send code/commands and receive results without a full network
+   stack. Critical for sandbox control plane (execute code, stream output, transfer files).
+
+2. **VM snapshotting / restore** -- save full VM state (memory + device + vCPU registers)
+   to disk, restore in ~5ms. Enables pre-booted "warm" VMs: boot once, snapshot after
+   init, restore copies on demand. Key to <50ms cold start for sandbox instances.
+
+3. **VM pool / warm start** -- pre-fork a pool of restored VMs ready for immediate use.
+   Combined with snapshots, this gives near-instant sandbox provisioning.
+
+4. **Seccomp + jailer** -- syscall filtering and namespace/cgroup isolation for the VMM
+   process itself. Defense in depth: even if a guest escapes KVM, the VMM is sandboxed.
+
+5. **Higher-level sandbox API** -- extend the REST API with sandbox-oriented endpoints:
+   execute code, stream stdout/stderr, upload/download files, set timeouts and resource
+   limits. This is the interface AI agents actually talk to.
+
+6. **Rate limiters** -- throttle virtio-blk and virtio-net I/O to enforce resource limits
+   per sandbox instance.
+
+7. **Metrics / logging** -- structured telemetry for sandbox lifecycle, resource usage,
+   and error tracking.
+
+#### Future enhancements
+- vhost-net kernel acceleration for networking
+- `ioeventfd`/`irqfd` for kernel-bypass virtio notifications
 - Multi-vCPU support (thread per vCPU, mutex on shared device state)
+- CPUID filtering (topology, HYPERVISOR bit, VMX/SMX)
 
-## What Firecracker has that existing Zig VMMs don't
+## Target use case
 
-- REST API / Unix socket control plane
-- Seccomp filtering
-- Jailer (namespace + cgroup isolation)
-- Rate limiters on virtio devices
-- VM snapshotting / restore
-- Proper virtio device reset / cleanup
-- vsock support
-- Metrics / logging infrastructure
-- Production hardening and operational maturity
+Flint is designed as the VM layer for **AI agent code execution sandboxes** -- similar to
+E2B or Cloudflare's sandbox environments. Each sandbox is a lightweight microVM that:
 
-This is where Flint's value lies -- not just another KVM wrapper, but a production-grade microVMM.
+- Boots in <1 second (or <50ms with snapshot restore)
+- Runs arbitrary code from AI agents in full Linux isolation
+- Communicates with the host via vsock (no IP networking overhead)
+- Can be pooled and recycled for high throughput
+- Is secured by KVM hardware isolation + seccomp + namespaces
