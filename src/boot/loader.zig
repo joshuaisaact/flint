@@ -51,8 +51,10 @@ pub fn loadBzImage(mem: *Memory, kernel_path: [*:0]const u8, cmdline: []const u8
         return error.KernelTooSmall;
     }
 
-    // Parse the setup header at offset 0x1F1
-    const hdr: *const params.SetupHeader = @ptrCast(@alignCast(&kernel_data[0x1F1]));
+    // Parse the setup header at offset 0x1F1 (unaligned, so we copy it out)
+    var hdr: params.SetupHeader = undefined;
+    const hdr_src = kernel_data[0x1F1..][0..@sizeOf(params.SetupHeader)];
+    @memcpy(std.mem.asBytes(&hdr), hdr_src);
 
     if (hdr.header != params.HDRS_MAGIC) {
         log.err("invalid bzImage: missing HdrS magic (got 0x{x})", .{hdr.header});
@@ -95,25 +97,43 @@ pub fn loadBzImage(mem: *Memory, kernel_path: [*:0]const u8, cmdline: []const u8
     const bp = try mem.slice(params.BOOT_PARAMS_ADDR, params.BOOT_PARAMS_SIZE);
     @memset(bp, 0);
 
-    // Copy the original setup header into boot_params at the correct offset
-    // OFF_ constants are offsets within the 4096-byte boot_params struct
-    const hdr_bytes = std.mem.asBytes(hdr);
-    @memcpy(bp[params.OFF_SETUP_HEADER..][0..hdr_bytes.len], hdr_bytes);
+    // Copy the ENTIRE setup header from the kernel image into boot_params.
+    // The setup header extends from offset 0x1F1 well beyond our SetupHeader struct
+    // (the kernel reads fields up to at least 0x264, e.g. init_size).
+    // The setup header in the file spans from 0x1F1 to the end of the first sector+setup.
+    const raw_hdr_max = @min(setup_size, params.BOOT_PARAMS_SIZE) - params.OFF_SETUP_HEADER;
+    const src_hdr = kernel_data[params.OFF_SETUP_HEADER..][0..raw_hdr_max];
+    @memcpy(bp[params.OFF_SETUP_HEADER..][0..raw_hdr_max], src_hdr);
 
-    // Patch the fields we need to set
-    const bp_hdr: *params.SetupHeader = @ptrCast(@alignCast(&bp[params.OFF_SETUP_HEADER]));
-    bp_hdr.type_of_loader = 0xFF; // undefined loader
-    bp_hdr.loadflags |= params.CAN_USE_HEAP;
-    bp_hdr.heap_end_ptr = 0xFE00;
-    bp_hdr.cmd_line_ptr = params.CMDLINE_ADDR;
+    // Patch the specific fields we need to override
+    // type_of_loader at boot_params offset 0x210
+    bp[0x210] = 0xFF;
+    // loadflags at boot_params offset 0x211
+    bp[0x211] |= params.CAN_USE_HEAP;
+    // heap_end_ptr at boot_params offset 0x224 (u16 LE)
+    bp[0x224] = 0x00;
+    bp[0x225] = 0xFE;
+    // cmd_line_ptr at boot_params offset 0x228 (u32 LE)
+    std.mem.writeInt(u32, bp[0x228..][0..4], params.CMDLINE_ADDR, .little);
 
-    // Set up e820 memory map
-    const e820_ptr: *[128]params.E820Entry = @ptrCast(@alignCast(&bp[params.OFF_E820_TABLE]));
-    e820_ptr[0] = .{ .addr = 0, .size = 0xA0000, .type_ = params.E820Entry.RAM }; // 640KB conventional
-    e820_ptr[1] = .{ .addr = 0x100000, .size = mem.size() - 0x100000, .type_ = params.E820Entry.RAM }; // rest from 1MB
-    bp[params.OFF_E820_ENTRIES] = 2;
+    // Set up e820 memory map by writing raw bytes (20 bytes per entry, no padding)
+    const e820_entries = [_]params.E820Entry{
+        .{ .addr = 0, .size = 0x9FC00, .type_ = params.E820Entry.RAM }, // Conventional memory
+        .{ .addr = 0x9FC00, .size = 0x400, .type_ = params.E820Entry.RESERVED }, // EBDA
+        .{ .addr = 0xF0000, .size = 0x10000, .type_ = params.E820Entry.RESERVED }, // BIOS ROM
+        .{ .addr = 0x100000, .size = mem.size() - 0x100000, .type_ = params.E820Entry.RAM }, // Main RAM
+    };
+    for (e820_entries, 0..) |entry, i| {
+        const off = params.OFF_E820_TABLE + i * 20;
+        std.mem.writeInt(u64, bp[off..][0..8], entry.addr, .little);
+        std.mem.writeInt(u64, bp[off + 8 ..][0..8], entry.size, .little);
+        std.mem.writeInt(u32, bp[off + 16 ..][0..4], entry.type_, .little);
+    }
+    bp[params.OFF_E820_ENTRIES] = e820_entries.len;
 
-    log.info("boot_params at guest 0x{x}, cmdline at 0x{x}", .{ params.BOOT_PARAMS_ADDR, params.CMDLINE_ADDR });
+    log.info("boot_params at guest 0x{x}, cmdline at 0x{x}, e820 entries: {}", .{
+        params.BOOT_PARAMS_ADDR, params.CMDLINE_ADDR, e820_entries.len,
+    });
 
     return .{
         .entry_addr = params.KERNEL_ADDR,

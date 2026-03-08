@@ -6,7 +6,7 @@ const std = @import("std");
 
 /// The setup header, located at offset 0x1F1 in the bzImage.
 /// We only define the fields we read/write.
-pub const SetupHeader = extern struct {
+pub const SetupHeader = packed struct {
     setup_sects: u8,
     root_flags: u16,
     syssize: u32,
@@ -40,7 +40,7 @@ pub const SetupHeader = extern struct {
 };
 
 /// E820 memory map entry.
-pub const E820Entry = extern struct {
+pub const E820Entry = packed struct {
     addr: u64,
     size: u64,
     type_: u32,

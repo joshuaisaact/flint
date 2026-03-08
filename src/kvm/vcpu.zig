@@ -88,6 +88,12 @@ pub fn getIoData(self: Self) IoExit {
     };
 }
 
+const Kvm = @import("system.zig");
+
+pub fn setCpuid(self: Self, cpuid: *Kvm.CpuidBuffer) !void {
+    try abi.ioctlVoid(self.fd, c.KVM_SET_CPUID2, @intFromPtr(cpuid));
+}
+
 pub const IoExit = struct {
     direction: u8,
     port: u16,

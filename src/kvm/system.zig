@@ -46,3 +46,24 @@ pub fn checkExtension(self: Self, extension: u32) !bool {
     const ret = try abi.ioctl(self.fd, c.KVM_CHECK_EXTENSION, extension);
     return ret > 0;
 }
+
+/// Maximum CPUID entries we support.
+pub const MAX_CPUID_ENTRIES = 256;
+
+/// Buffer for KVM_GET_SUPPORTED_CPUID / KVM_SET_CPUID2.
+/// Matches the layout of kvm_cpuid2 with a fixed-size entries array.
+pub const CpuidBuffer = extern struct {
+    nent: u32,
+    padding: u32 = 0,
+    entries: [MAX_CPUID_ENTRIES]c.kvm_cpuid_entry2,
+};
+
+/// Get the CPUID entries supported by this host.
+pub fn getSupportedCpuid(self: Self) !CpuidBuffer {
+    var buf: CpuidBuffer = undefined;
+    buf.nent = MAX_CPUID_ENTRIES;
+    buf.padding = 0;
+    try abi.ioctlVoid(self.fd, c.KVM_GET_SUPPORTED_CPUID, @intFromPtr(&buf));
+    log.info("got {} supported CPUID entries", .{buf.nent});
+    return buf;
+}
