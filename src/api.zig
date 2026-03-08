@@ -16,6 +16,8 @@ pub const VmConfig = struct {
     boot_args: ?[:0]const u8 = null,
     disk_path: ?[:0]const u8 = null,
     tap_name: ?[:0]const u8 = null,
+    vsock_cid: ?[:0]const u8 = null,
+    vsock_uds: ?[:0]const u8 = null,
     mem_size_mib: u32 = 512,
 };
 
@@ -43,13 +45,13 @@ const MachineConfigBody = struct {
     mem_size_mib: ?u32 = null,
 };
 
-const ActionBody = struct {
-    action_type: []const u8,
+const VsockBody = struct {
+    guest_cid: u64,
+    uds_path: []const u8,
 };
 
-// JSON response helpers
-const ErrorResponse = struct {
-    fault_message: []const u8,
+const ActionBody = struct {
+    action_type: []const u8,
 };
 
 const MachineConfigResponse = struct {
@@ -158,6 +160,8 @@ fn handleRequest(request: *http.Server.Request, allocator: std.mem.Allocator, co
         return handleDrive(request, body, allocator, config);
     } else if (method == .PUT and std.mem.startsWith(u8, target, "/network-interfaces/")) {
         return handleNetIface(request, body, allocator, config);
+    } else if (method == .PUT and std.mem.eql(u8, target, "/vsock")) {
+        return handleVsock(request, body, allocator, config);
     } else if (method == .PUT and std.mem.eql(u8, target, "/machine-config")) {
         return handleMachineConfig(request, body, config);
     } else if (method == .GET and std.mem.eql(u8, target, "/machine-config")) {
@@ -245,6 +249,45 @@ fn handleNetIface(request: *http.Server.Request, body: ?[]const u8, allocator: s
     defer parsed.deinit();
 
     config.tap_name = allocator.dupeZ(u8, parsed.value.host_dev_name) catch {
+        respondError(request, .internal_server_error, "allocation failed");
+        return .err;
+    };
+
+    respondOk(request);
+    return .ok;
+}
+
+fn handleVsock(request: *http.Server.Request, body: ?[]const u8, allocator: std.mem.Allocator, config: *VmConfig) RequestResult {
+    const data = body orelse {
+        respondError(request, .bad_request, "missing request body");
+        return .ok;
+    };
+
+    const parsed = json.parseFromSlice(VsockBody, allocator, data, .{
+        .ignore_unknown_fields = true,
+    }) catch {
+        respondError(request, .bad_request, "invalid JSON");
+        return .ok;
+    };
+    defer parsed.deinit();
+
+    if (parsed.value.guest_cid < 3) {
+        respondError(request, .bad_request, "guest_cid must be >= 3");
+        return .ok;
+    }
+
+    // Store CID as decimal string
+    var cid_buf: [20]u8 = undefined;
+    const cid_str = std.fmt.bufPrint(&cid_buf, "{d}", .{parsed.value.guest_cid}) catch {
+        respondError(request, .internal_server_error, "format failed");
+        return .err;
+    };
+    config.vsock_cid = allocator.dupeZ(u8, cid_str) catch {
+        respondError(request, .internal_server_error, "allocation failed");
+        return .err;
+    };
+
+    config.vsock_uds = allocator.dupeZ(u8, parsed.value.uds_path) catch {
         respondError(request, .internal_server_error, "allocation failed");
         return .err;
     };

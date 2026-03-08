@@ -33,8 +33,9 @@ pub const MMIO_VERSION_2: u32 = 2;
 pub const VENDOR_ID: u32 = 0x554D4551; // "QEMU" style
 
 // Device IDs
-pub const DEVICE_ID_BLOCK: u32 = 2;
 pub const DEVICE_ID_NET: u32 = 1;
+pub const DEVICE_ID_BLOCK: u32 = 2;
+pub const DEVICE_ID_VSOCK: u32 = 19;
 
 // Device status bits
 pub const STATUS_ACKNOWLEDGE: u8 = 1;

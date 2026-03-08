@@ -68,6 +68,7 @@ src/
       mmio.zig      -- virtio-mmio v2 transport layer
       blk.zig       -- virtio-blk device backend
       net.zig       -- virtio-net device backend (TAP)
+      vsock.zig     -- virtio-vsock device backend (AF_UNIX relay)
       queue.zig     -- split virtqueue (desc table, avail/used rings)
 ```
 
@@ -137,18 +138,30 @@ src/
   - PUT /network-interfaces/{id} (host_dev_name)
   - PUT /machine-config (mem_size_mib)
   - GET /machine-config
+  - PUT /vsock (guest_cid, uds_path)
   - PUT /actions (InstanceStart)
 - Two-phase lifecycle: configure via API, then InstanceStart triggers boot
 - Both CLI and API boot modes supported (`--api-sock <path>` flag)
 - **Result: full VM configuration and boot via curl against Unix socket**
 
+### Phase 4a: vsock -- DONE
+- virtio-vsock device backend (device ID 19, 3 queues: RX + TX + EVT)
+- Userspace vsock (Firecracker model): guest connects to host CID 2, port P,
+  VMM connects to `{uds_path}_{P}` on the host via AF_UNIX
+- 44-byte virtio vsock header (virtio spec v1.2) with full field parsing
+- Connection state machine with 64 simultaneous connections
+- Flow control: buf_alloc / fwd_cnt credit-based system
+- All vsock operations: REQUEST, RESPONSE, RST, SHUTDOWN, RW, CREDIT_UPDATE/REQUEST
+- Non-blocking host socket I/O with EAGAIN handling
+- CLI flags: `--vsock-cid <cid> --vsock-uds <path>`
+- API endpoint: PUT /vsock
+- **Result: guest↔host bidirectional communication via AF_VSOCK sockets**
+
 ### Phase 4: Sandbox runtime (in progress)
 
 Priority order optimized for AI agent code execution sandbox use case:
 
-1. **vsock (virtio-socket)** -- host↔guest communication without IP networking.
-   Enables the host to send code/commands and receive results without a full network
-   stack. Critical for sandbox control plane (execute code, stream output, transfer files).
+1. ~~**vsock (virtio-socket)**~~ -- DONE (Phase 4a)
 
 2. **VM snapshotting / restore** -- save full VM state (memory + device + vCPU registers)
    to disk, restore in ~5ms. Enables pre-booted "warm" VMs: boot once, snapshot after

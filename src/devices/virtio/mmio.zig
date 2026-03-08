@@ -8,6 +8,7 @@ const virtio = @import("../virtio.zig");
 const Queue = @import("queue.zig");
 const Blk = @import("blk.zig");
 const Net = @import("net.zig");
+const Vsock = @import("vsock.zig");
 
 const log = std.log.scoped(.virtio_mmio);
 
@@ -16,6 +17,7 @@ const Self = @This();
 const Backend = union(enum) {
     blk: Blk,
     net: Net,
+    vsock: Vsock,
 };
 
 // Device identity
@@ -32,8 +34,8 @@ queue_sel: u32 = 0,
 interrupt_status: u32 = 0,
 config_generation: u32 = 0,
 
-// Queues: blk uses 1, net uses 2 (RX + TX)
-queues: [2]Queue = .{ .{}, .{} },
+// Queues: blk uses 1, net uses 2 (RX + TX), vsock uses 3 (RX + TX + EVT)
+queues: [3]Queue = .{ .{}, .{}, .{} },
 
 // Backend
 backend: Backend,
@@ -60,10 +62,22 @@ pub fn initNet(mmio_base: u64, irq: u32, tap_name: [*:0]const u8) !Self {
     };
 }
 
+pub fn initVsock(mmio_base: u64, irq: u32, guest_cid: u64, uds_path: [*:0]const u8) !Self {
+    const vsock = try Vsock.init(guest_cid, uds_path);
+    log.info("virtio-vsock at MMIO 0x{x} IRQ {} CID {}", .{ mmio_base, irq, guest_cid });
+    return .{
+        .device_id = virtio.DEVICE_ID_VSOCK,
+        .mmio_base = mmio_base,
+        .irq = irq,
+        .backend = .{ .vsock = vsock },
+    };
+}
+
 pub fn deinit(self: *Self) void {
     switch (self.backend) {
         .blk => |b| b.deinit(),
         .net => |n| n.deinit(),
+        .vsock => self.backend.vsock.deinit(),
     }
 }
 
@@ -71,6 +85,7 @@ fn numQueues(self: Self) u32 {
     return switch (self.backend) {
         .blk => 1,
         .net => Net.NUM_QUEUES,
+        .vsock => Vsock.NUM_QUEUES,
     };
 }
 
@@ -78,6 +93,7 @@ fn deviceFeatures(self: Self) u64 {
     return switch (self.backend) {
         .blk => Blk.deviceFeatures(),
         .net => Net.deviceFeatures(),
+        .vsock => Vsock.deviceFeatures(),
     };
 }
 
@@ -110,6 +126,7 @@ pub fn handleRead(self: *Self, offset: u64, data: []u8) void {
         switch (self.backend) {
             .blk => |b| b.readConfig(offset - virtio.MMIO_CONFIG, data),
             .net => |n| n.readConfig(offset - virtio.MMIO_CONFIG, data),
+            .vsock => |v| v.readConfig(offset - virtio.MMIO_CONFIG, data),
         }
         return;
     }
@@ -262,6 +279,15 @@ pub fn processQueues(self: *Self, mem: *Memory) bool {
                 if (n.processTx(mem, &self.queues[Net.TX_QUEUE])) did_work = true;
             }
         },
+        .vsock => {
+            // Process TX queue (queue 1) and deliver pending control packets
+            if (self.queues[Vsock.TX_QUEUE].isReady()) {
+                if (self.backend.vsock.processTx(mem, &self.queues[Vsock.TX_QUEUE])) did_work = true;
+            }
+            if (self.queues[Vsock.RX_QUEUE].isReady()) {
+                if (self.backend.vsock.deliverPending(mem, &self.queues[Vsock.RX_QUEUE])) did_work = true;
+            }
+        },
     }
 
     if (did_work) {
@@ -278,6 +304,13 @@ pub fn pollRx(self: *Self, mem: *Memory) bool {
         .net => |n| {
             if (!self.queues[Net.RX_QUEUE].isReady()) return false;
             if (n.pollRx(mem, &self.queues[Net.RX_QUEUE])) {
+                self.interrupt_status |= virtio.INT_USED_RING;
+                return true;
+            }
+        },
+        .vsock => {
+            if (!self.queues[Vsock.RX_QUEUE].isReady()) return false;
+            if (self.backend.vsock.pollRx(mem, &self.queues[Vsock.RX_QUEUE])) {
                 self.interrupt_status |= virtio.INT_USED_RING;
                 return true;
             }

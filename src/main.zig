@@ -27,6 +27,8 @@ pub fn main(init: std.process.Init) !void {
     var initrd_path: ?[*:0]const u8 = null;
     var disk_path: ?[*:0]const u8 = null;
     var tap_name: ?[*:0]const u8 = null;
+    var vsock_cid: ?[*:0]const u8 = null;
+    var vsock_uds: ?[*:0]const u8 = null;
     var cmdline: [*:0]const u8 = DEFAULT_CMDLINE;
     var got_initrd = false;
 
@@ -48,6 +50,16 @@ pub fn main(init: std.process.Init) !void {
                 std.debug.print("--tap requires an argument\n", .{});
                 std.process.exit(1);
             };
+        } else if (std.mem.eql(u8, s, "--vsock-cid")) {
+            vsock_cid = args.next() orelse {
+                std.debug.print("--vsock-cid requires an argument\n", .{});
+                std.process.exit(1);
+            };
+        } else if (std.mem.eql(u8, s, "--vsock-uds")) {
+            vsock_uds = args.next() orelse {
+                std.debug.print("--vsock-uds requires an argument\n", .{});
+                std.process.exit(1);
+            };
         } else if (std.mem.indexOfScalar(u8, s, '=') != null) {
             cmdline = arg;
         } else if (kernel_path == null) {
@@ -67,13 +79,16 @@ pub fn main(init: std.process.Init) !void {
         const ba: ?[*:0]const u8 = if (config.boot_args) |p| p.ptr else null;
         const dp: ?[*:0]const u8 = if (config.disk_path) |p| p.ptr else null;
         const tn: ?[*:0]const u8 = if (config.tap_name) |p| p.ptr else null;
-        try bootVm(kp, ip, ba, dp, tn, config.mem_size_mib);
+        const vc: ?[*:0]const u8 = if (config.vsock_cid) |p| p.ptr else null;
+        const vu: ?[*:0]const u8 = if (config.vsock_uds) |p| p.ptr else null;
+        try bootVm(kp, ip, ba, dp, tn, vc, vu, config.mem_size_mib);
     } else if (kernel_path) |kp| {
         // CLI mode: boot directly from args
-        try bootVm(kp, initrd_path, cmdline, disk_path, tap_name, DEFAULT_MEM_SIZE / (1024 * 1024));
+        try bootVm(kp, initrd_path, cmdline, disk_path, tap_name, vsock_cid, vsock_uds, DEFAULT_MEM_SIZE / (1024 * 1024));
     } else {
         std.debug.print("usage: flint <kernel> [initrd] [--disk <path>] [--tap <name>] [cmdline]\n", .{});
         std.debug.print("       flint --api-sock <path>\n", .{});
+        std.debug.print("       flint --vsock-cid <cid> --vsock-uds <path>\n", .{});
         std.process.exit(1);
     }
 }
@@ -84,6 +99,8 @@ fn bootVm(
     cmdline_or_args: ?[*:0]const u8,
     disk_path: ?[*:0]const u8,
     tap_name: ?[*:0]const u8,
+    vsock_cid_str: ?[*:0]const u8,
+    vsock_uds_path: ?[*:0]const u8,
     mem_size_mib: u32,
 ) !void {
     const mem_size: usize = @as(usize, mem_size_mib) * 1024 * 1024;
@@ -134,6 +151,22 @@ fn bootVm(
         const base = virtio.MMIO_BASE + @as(u64, device_count) * virtio.MMIO_SIZE;
         const irq = virtio.IRQ_BASE + device_count;
         devices[device_count] = try VirtioMmio.initNet(base, irq, tn);
+        device_count += 1;
+    }
+
+    if (vsock_cid_str) |cid_str| {
+        const uds = vsock_uds_path orelse {
+            log.err("--vsock-cid requires --vsock-uds", .{});
+            return error.MissingVsockUds;
+        };
+        const cid_len = std.mem.indexOfSentinel(u8, 0, cid_str);
+        const cid = std.fmt.parseUnsigned(u64, cid_str[0..cid_len], 10) catch {
+            log.err("invalid vsock CID: {s}", .{cid_str[0..cid_len]});
+            return error.InvalidCid;
+        };
+        const base = virtio.MMIO_BASE + @as(u64, device_count) * virtio.MMIO_SIZE;
+        const irq = virtio.IRQ_BASE + device_count;
+        devices[device_count] = try VirtioMmio.initVsock(base, irq, cid, uds);
         device_count += 1;
     }
 
