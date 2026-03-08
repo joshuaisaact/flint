@@ -56,6 +56,8 @@ src/
   seccomp.zig       -- BPF syscall filter (comptime-generated whitelist)
   pool.zig          -- VM pool manager (process-per-VM, fork+exec)
   pool_api.zig      -- pool REST API (acquire/release/status)
+  sandbox.zig       -- host-side agent connection (vsock UDS listener)
+  agent.zig         -- guest-side sandbox daemon (runs inside VM)
   memory.zig        -- guest physical memory management (mmap regions)
   tests.zig         -- unit tests
   kvm/
@@ -188,9 +190,10 @@ Priority order optimized for AI agent code execution sandbox use case:
    development (LOG instead of KILL). All file paths relative to jail root after
    pivot_root.
 
-5. **Higher-level sandbox API** -- extend the REST API with sandbox-oriented endpoints:
-   execute code, stream stdout/stderr, upload/download files, set timeouts and resource
-   limits. This is the interface AI agents actually talk to.
+5. ~~**Higher-level sandbox API**~~ -- DONE. Guest-side agent daemon (`flint-agent`)
+   connects to host over vsock, executes commands via fork+exec, handles file I/O.
+   Host-side thin proxy in the post-boot API: POST /sandbox/exec, /sandbox/write,
+   /sandbox/read. Length-prefixed JSON protocol with base64 binary encoding.
 
 6. **Rate limiters** -- throttle virtio-blk and virtio-net I/O to enforce resource limits
    per sandbox instance.

@@ -9,6 +9,7 @@ const json = std.json;
 
 const snapshot = @import("snapshot.zig");
 const main_mod = @import("main.zig");
+const sandbox = @import("sandbox.zig");
 
 const log = std.log.scoped(.api);
 
@@ -504,6 +505,12 @@ fn handlePostBootRequest(
         handleSnapshotCreate(request, body, allocator, runtime);
     } else if (method == .GET and std.mem.eql(u8, target, "/vm")) {
         handleVmGet(request, runtime);
+    } else if (method == .POST and std.mem.eql(u8, target, "/sandbox/exec")) {
+        handleSandboxExec(request, body, runtime);
+    } else if (method == .POST and std.mem.eql(u8, target, "/sandbox/write")) {
+        handleSandboxWrite(request, body, runtime);
+    } else if (method == .POST and std.mem.eql(u8, target, "/sandbox/read")) {
+        handleSandboxRead(request, body, runtime);
     } else {
         respondError(request, .not_found, "resource not found");
     }
@@ -650,4 +657,90 @@ fn handleVmGet(request: *http.Server.Request, runtime: *main_mod.VmRuntime) void
             .{ .name = "content-type", .value = "application/json" },
         },
     }) catch {};
+}
+
+// --- Sandbox API ---
+// Thin proxy to the in-VM agent over vsock. The agent protocol uses
+// length-prefixed JSON with base64-encoded binary data. We forward
+// the client's request body directly as the agent command (adding the
+// "method" field) and return the agent's JSON response as-is.
+// Clients receive base64 stdout/stderr and decode them themselves.
+
+fn getAgent(runtime: *const main_mod.VmRuntime) ?*sandbox.AgentConn {
+    return runtime.agent;
+}
+
+/// Send a command to the agent via the client's request body.
+/// The body is forwarded with an added "method" field.
+/// Agent response is returned directly to the HTTP client.
+fn sandboxProxy(
+    request: *http.Server.Request,
+    body: ?[]const u8,
+    runtime: *main_mod.VmRuntime,
+    method: []const u8,
+) void {
+    const agent = getAgent(runtime) orelse {
+        respondError(request, .service_unavailable, "sandbox agent not connected");
+        return;
+    };
+
+    const data = body orelse {
+        respondError(request, .bad_request, "missing request body");
+        return;
+    };
+
+    // Inject "method" into the client's JSON by prepending it.
+    // Client sends: {"cmd":"echo hi","timeout":30}
+    // We send:      {"method":"exec","cmd":"echo hi","timeout":30}
+    if (data.len < 2 or data[0] != '{') {
+        respondError(request, .bad_request, "invalid JSON");
+        return;
+    }
+
+    var msg_buf: [64 * 1024]u8 = undefined;
+    const msg = std.fmt.bufPrint(&msg_buf,
+        \\{{"method":"{s}",{s}
+    , .{ method, data[1..] }) catch {
+        respondError(request, .bad_request, "request too large");
+        return;
+    };
+
+    // Must hold the agent's full response: base64-encoded stdout (up to ~341KB)
+    // plus JSON framing, or base64 file reads (up to ~341KB).
+    var resp_buf: [768 * 1024]u8 = undefined;
+    const agent_resp = agent.command(msg, &resp_buf) catch {
+        respondError(request, .internal_server_error, "agent communication failed");
+        return;
+    };
+
+    request.respond(agent_resp, .{
+        .status = .ok,
+        .extra_headers = &.{
+            .{ .name = "content-type", .value = "application/json" },
+        },
+    }) catch {};
+}
+
+fn handleSandboxExec(
+    request: *http.Server.Request,
+    body: ?[]const u8,
+    runtime: *main_mod.VmRuntime,
+) void {
+    sandboxProxy(request, body, runtime, "exec");
+}
+
+fn handleSandboxWrite(
+    request: *http.Server.Request,
+    body: ?[]const u8,
+    runtime: *main_mod.VmRuntime,
+) void {
+    sandboxProxy(request, body, runtime, "write_file");
+}
+
+fn handleSandboxRead(
+    request: *http.Server.Request,
+    body: ?[]const u8,
+    runtime: *main_mod.VmRuntime,
+) void {
+    sandboxProxy(request, body, runtime, "read_file");
 }

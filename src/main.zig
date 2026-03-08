@@ -16,6 +16,7 @@ const jail = @import("jail.zig");
 const seccomp = @import("seccomp.zig");
 const pool_mod = @import("pool.zig");
 const pool_api = @import("pool_api.zig");
+const sandbox = @import("sandbox.zig");
 
 const log = std.log.scoped(.flint);
 
@@ -36,6 +37,7 @@ pub const VmRuntime = struct {
     devices: *DeviceArray,
     device_count: u32,
     snap_opts: SnapshotOpts,
+    agent: ?*sandbox.AgentConn = null,
 
     // Pause mechanism: API thread sets paused=true and immediate_exit=1.
     // KVM_RUN returns -EINTR, run loop sees paused=true and spins on
@@ -421,6 +423,15 @@ fn bootVmWithApi(
     var c_ = try createVmComponents(kernel_path, initrd_path, cmdline_or_args, disk_path, tap_name, vsock_cid_str, vsock_uds_path, mem_size_mib);
     defer c_.deinit();
 
+    var agent_conn: sandbox.AgentConn = .{};
+    if (vsock_uds_path) |uds| {
+        agent_conn = sandbox.AgentConn.listen(uds) catch |err| blk: {
+            log.warn("agent listener failed: {}, sandbox API disabled", .{err});
+            break :blk .{};
+        };
+    }
+    defer agent_conn.deinit();
+
     var runtime = VmRuntime{
         .vcpu = &c_.vcpu,
         .vm = &c_.vm,
@@ -436,6 +447,15 @@ fn bootVmWithApi(
         log.err("failed to spawn run loop thread: {}", .{err});
         return error.ThreadSpawnFailed;
     };
+
+    if (agent_conn.listen_fd >= 0) {
+        agent_conn.accept() catch |err| {
+            log.warn("agent accept failed: {}, sandbox API disabled", .{err});
+        };
+        if (agent_conn.fd >= 0) {
+            runtime.agent = &agent_conn;
+        }
+    }
 
     api.servePostBoot(api_sock_path, io, allocator, &runtime) catch |err| {
         log.err("post-boot API error: {}", .{err});
@@ -553,6 +573,17 @@ fn restoreVmWithApi(
 
     try vm.setMemoryRegion(0, 0, mem.alignedMem());
 
+    // Set up agent listener before the VM resumes so the socket exists
+    // when the guest daemon connects over vsock
+    var agent_conn: sandbox.AgentConn = .{};
+    if (vsock_uds_path) |uds| {
+        agent_conn = sandbox.AgentConn.listen(uds) catch |err| blk: {
+            log.warn("agent listener failed: {}, sandbox API disabled", .{err});
+            break :blk .{};
+        };
+    }
+    defer agent_conn.deinit();
+
     var runtime = VmRuntime{
         .vcpu = &vcpu,
         .vm = &vm,
@@ -568,6 +599,16 @@ fn restoreVmWithApi(
         log.err("failed to spawn run loop thread: {}", .{err});
         return error.ThreadSpawnFailed;
     };
+
+    // Wait for the guest agent to connect (blocks up to ~10s)
+    if (agent_conn.listen_fd >= 0) {
+        agent_conn.accept() catch |err| {
+            log.warn("agent accept failed: {}, sandbox API disabled", .{err});
+        };
+        if (agent_conn.fd >= 0) {
+            runtime.agent = &agent_conn;
+        }
+    }
 
     api.servePostBoot(api_sock_path, io, allocator, &runtime) catch |err| {
         log.err("post-boot API error: {}", .{err});

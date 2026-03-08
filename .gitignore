@@ -1,2 +1,9 @@
 .zig-cache/
 zig-out/
+
+# Binary artifacts
+*.img
+*.deb
+bzImage
+initrd.cpio.gz
+snapshot.*

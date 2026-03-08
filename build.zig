@@ -18,6 +18,17 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
+    // Guest-side sandbox agent (static, runs inside VM)
+    const agent = b.addExecutable(.{
+        .name = "flint-agent",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/agent.zig"),
+            .target = target,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+    b.installArtifact(agent);
+
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| {
