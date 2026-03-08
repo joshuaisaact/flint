@@ -62,20 +62,22 @@ const MachineConfigResponse = struct {
     vcpu_count: u32 = 1,
 };
 
-/// Run the API server. Blocks until InstanceStart is received.
-/// Returns the accumulated VM configuration.
-pub fn serve(sock_path: []const u8, io: Io, allocator: std.mem.Allocator) !VmConfig {
-    // Remove stale socket file
+/// Bind a Unix socket: unlink stale file, resolve address, listen.
+fn listenUnix(sock_path: []const u8, io: Io) !Io.net.Server {
     if (sock_path.len <= Io.net.UnixAddress.max_len) {
-        // Best-effort removal of old socket
         var path_buf: [Io.net.UnixAddress.max_len + 1]u8 = undefined;
         @memcpy(path_buf[0..sock_path.len], sock_path);
         path_buf[sock_path.len] = 0;
         _ = std.os.linux.unlink(@ptrCast(path_buf[0..sock_path.len :0]));
     }
-
     const addr = try Io.net.UnixAddress.init(sock_path);
-    var server = try addr.listen(io, .{});
+    return addr.listen(io, .{});
+}
+
+/// Run the API server. Blocks until InstanceStart is received.
+/// Returns the accumulated VM configuration.
+pub fn serve(sock_path: []const u8, io: Io, allocator: std.mem.Allocator) !VmConfig {
+    var server = try listenUnix(sock_path, io);
     defer server.deinit(io);
 
     log.info("API listening on {s}", .{sock_path});
@@ -382,9 +384,11 @@ fn readBody(request: *http.Server.Request, buf: []u8) !?[]const u8 {
     if (content_length == 0) return null;
     if (content_length > buf.len) return error.BodyTooLarge;
 
-    var body_reader = request.readerExpectNone(buf);
-    const data = body_reader.readAlloc(std.heap.page_allocator, @intCast(content_length)) catch return error.ReadFailed;
-    return data;
+    var reader_buf: [1024]u8 = undefined;
+    var body_reader = request.readerExpectNone(&reader_buf);
+    const len: usize = @intCast(content_length);
+    body_reader.readSliceAll(buf[0..len]) catch return error.ReadFailed;
+    return buf[0..len];
 }
 
 fn respondOk(request: *http.Server.Request) void {
@@ -432,16 +436,7 @@ pub fn servePostBoot(
     allocator: std.mem.Allocator,
     runtime: *main_mod.VmRuntime,
 ) !void {
-    // Re-bind the socket (pre-boot server closed it)
-    if (sock_path.len <= Io.net.UnixAddress.max_len) {
-        var path_buf: [Io.net.UnixAddress.max_len + 1]u8 = undefined;
-        @memcpy(path_buf[0..sock_path.len], sock_path);
-        path_buf[sock_path.len] = 0;
-        _ = std.os.linux.unlink(@ptrCast(path_buf[0..sock_path.len :0]));
-    }
-
-    const addr = try Io.net.UnixAddress.init(sock_path);
-    var server = try addr.listen(io, .{});
+    var server = try listenUnix(sock_path, io);
     defer server.deinit(io);
 
     log.info("post-boot API listening on {s}", .{sock_path});
@@ -534,35 +529,38 @@ fn handleVmPatch(
     defer parsed.deinit();
 
     if (std.mem.eql(u8, parsed.value.state, "Paused")) {
-        if (runtime.paused.load(.acquire)) {
+        // Poke the vCPU first so KVM_RUN returns -EINTR.
+        // Must happen before the release-store on paused so the
+        // run loop's acquire-load sees both writes.
+        runtime.vcpu.kvm_run.immediate_exit = 1;
+
+        // Atomically transition false→true; rejects concurrent pause requests
+        if (runtime.paused.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) {
+            runtime.vcpu.kvm_run.immediate_exit = 0;
             respondError(request, .bad_request, "VM is already paused");
             return;
         }
-        // Signal the run loop to pause: set the flag, then poke the vCPU
-        // so KVM_RUN returns immediately with -EINTR
-        runtime.paused.store(true, .release);
-        runtime.vcpu.kvm_run.immediate_exit = 1;
 
-        // Wait for the run loop to acknowledge the pause
-        var spins: u32 = 0;
+        // Wait for the run loop to acknowledge it has left KVM_RUN
         while (!runtime.ack_paused.load(.acquire)) {
-            std.atomic.spinLoopHint();
-            spins += 1;
-            // If VM exited before we could pause it
             if (runtime.exited.load(.acquire)) {
                 runtime.paused.store(false, .release);
                 respondError(request, .bad_request, "VM has exited");
                 return;
             }
+            std.atomic.spinLoopHint();
         }
         log.info("VM paused", .{});
         respondOk(request);
     } else if (std.mem.eql(u8, parsed.value.state, "Resumed")) {
-        if (!runtime.paused.load(.acquire)) {
+        // Clear ack_paused first so the next pause must wait for a fresh ack
+        runtime.ack_paused.store(false, .release);
+
+        // Atomically transition true→false; rejects if not paused
+        if (runtime.paused.cmpxchgStrong(true, false, .acq_rel, .acquire) != null) {
             respondError(request, .bad_request, "VM is not paused");
             return;
         }
-        runtime.paused.store(false, .release);
         log.info("VM resumed", .{});
         respondOk(request);
     } else {
@@ -596,16 +594,21 @@ fn handleSnapshotCreate(
         };
         defer parsed.deinit();
 
-        if (parsed.value.snapshot_path.len < sp_buf.len) {
-            @memcpy(sp_buf[0..parsed.value.snapshot_path.len], parsed.value.snapshot_path);
-            sp_buf[parsed.value.snapshot_path.len] = 0;
-            vmstate_path = @ptrCast(sp_buf[0..parsed.value.snapshot_path.len :0]);
+        if (parsed.value.snapshot_path.len >= sp_buf.len) {
+            respondError(request, .bad_request, "snapshot_path too long");
+            return;
         }
-        if (parsed.value.mem_file_path.len < mp_buf.len) {
-            @memcpy(mp_buf[0..parsed.value.mem_file_path.len], parsed.value.mem_file_path);
-            mp_buf[parsed.value.mem_file_path.len] = 0;
-            mem_path = @ptrCast(mp_buf[0..parsed.value.mem_file_path.len :0]);
+        @memcpy(sp_buf[0..parsed.value.snapshot_path.len], parsed.value.snapshot_path);
+        sp_buf[parsed.value.snapshot_path.len] = 0;
+        vmstate_path = @ptrCast(sp_buf[0..parsed.value.snapshot_path.len :0]);
+
+        if (parsed.value.mem_file_path.len >= mp_buf.len) {
+            respondError(request, .bad_request, "mem_file_path too long");
+            return;
         }
+        @memcpy(mp_buf[0..parsed.value.mem_file_path.len], parsed.value.mem_file_path);
+        mp_buf[parsed.value.mem_file_path.len] = 0;
+        mem_path = @ptrCast(mp_buf[0..parsed.value.mem_file_path.len :0]);
     }
 
     // vCPU is paused (not in KVM_RUN), safe to read all state

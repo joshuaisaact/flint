@@ -150,7 +150,31 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
-fn bootVm(
+/// All live VM components created during setup. Returned by createVmComponents
+/// so callers own the resources and their lifetimes.
+const VmComponents = struct {
+    kvm: Kvm,
+    vm: Vm,
+    mem: Memory,
+    vcpu: Vcpu,
+    serial: Serial,
+    devices: DeviceArray,
+    device_count: u32,
+
+    fn deinit(self: *VmComponents) void {
+        for (&self.devices) |*d| {
+            if (d.*) |*dev| dev.deinit();
+        }
+        self.vcpu.deinit();
+        self.mem.deinit();
+        self.vm.deinit();
+        self.kvm.deinit();
+    }
+};
+
+/// Create KVM, VM, memory, devices, load kernel, set up vCPU registers.
+/// Returns all components by value (Zig uses RVO, no copy).
+fn createVmComponents(
     kernel_path: [*:0]const u8,
     initrd_path: ?[*:0]const u8,
     cmdline_or_args: ?[*:0]const u8,
@@ -159,12 +183,10 @@ fn bootVm(
     vsock_cid_str: ?[*:0]const u8,
     vsock_uds_path: ?[*:0]const u8,
     mem_size_mib: u32,
-    snap_opts: SnapshotOpts,
-) !void {
+) !VmComponents {
     const mem_size: usize = @as(usize, mem_size_mib) * 1024 * 1024;
     const cmdline: [*:0]const u8 = cmdline_or_args orelse DEFAULT_CMDLINE;
 
-    log.info("flint starting", .{});
     log.info("kernel: {s}", .{kernel_path});
     if (initrd_path) |p| log.info("initrd: {s}", .{p});
     if (disk_path) |p| log.info("disk: {s}", .{p});
@@ -172,132 +194,29 @@ fn bootVm(
     log.info("cmdline: {s}", .{cmdline});
     log.info("memory: {} MB", .{mem_size_mib});
 
-    // 1. Open KVM
     const kvm = try Kvm.open();
-    defer kvm.deinit();
+    errdefer kvm.deinit();
 
-    // 2. Create VM
     const vm = try kvm.createVm();
-    defer vm.deinit();
+    errdefer vm.deinit();
 
-    // 3. Set up Intel-required addresses (harmless on AMD)
     try vm.setTssAddr(0xFFFBD000);
     try vm.setIdentityMapAddr(0xFFFBC000);
 
-    // 4. Set up guest memory
     var mem = try Memory.init(mem_size);
-    defer mem.deinit();
-
+    errdefer mem.deinit();
     try vm.setMemoryRegion(0, 0, mem.alignedMem());
 
-    // 5. Create in-kernel devices
     try vm.createIrqChip();
     try vm.createPit2();
 
-    // 6. Set up virtio devices
-    var devices: [virtio.MAX_DEVICES]?VirtioMmio = .{null} ** virtio.MAX_DEVICES;
+    var devices: DeviceArray = .{null} ** virtio.MAX_DEVICES;
     const device_count = try initDevices(&devices, disk_path, tap_name, vsock_cid_str, vsock_uds_path);
-
-    defer for (&devices) |*d| {
+    errdefer for (&devices) |*d| {
         if (d.*) |*dev| dev.deinit();
     };
 
     // Build cmdline with virtio_mmio.device= entries
-    var cmdline_buf: [1024]u8 = undefined;
-    var effective_cmdline: [*:0]const u8 = cmdline;
-    if (device_count > 0) {
-        var pos: usize = 0;
-        const base_cmdline = cmdline[0..std.mem.indexOfSentinel(u8, 0, cmdline)];
-        if (base_cmdline.len >= cmdline_buf.len) {
-            log.err("kernel cmdline too long: {} bytes", .{base_cmdline.len});
-            return error.CmdlineTooLong;
-        }
-        @memcpy(cmdline_buf[pos..][0..base_cmdline.len], base_cmdline);
-        pos += base_cmdline.len;
-
-        for (0..device_count) |i| {
-            if (devices[i]) |dev| {
-                const entry = std.fmt.bufPrint(cmdline_buf[pos..], " virtio_mmio.device=4K@0x{x}:{d}", .{
-                    dev.mmio_base, dev.irq,
-                }) catch {
-                    log.err("cmdline buffer too small", .{});
-                    return error.CmdlineTooLong;
-                };
-                pos += entry.len;
-            }
-        }
-
-        if (pos < cmdline_buf.len) {
-            cmdline_buf[pos] = 0;
-            effective_cmdline = @ptrCast(&cmdline_buf);
-        }
-    }
-
-    // 7. Load the kernel (and initrd if provided)
-    const boot = try loader.loadBzImage(&mem, kernel_path, initrd_path, effective_cmdline);
-
-    // 8. Create vCPU and set up registers
-    const vcpu_mmap_size = try kvm.getVcpuMmapSize();
-    var vcpu = try vm.createVcpu(0, vcpu_mmap_size);
-    defer vcpu.deinit();
-
-    // Set CPUID (passthrough host CPU features so kernel sees APIC, TSC, etc.)
-    var cpuid = try kvm.getSupportedCpuid();
-    try vcpu.setCpuid(&cpuid);
-
-    try setupRegisters(&vcpu, boot, &mem);
-
-    // 9. Set up devices
-    var serial = Serial.init(1); // stdout fd
-
-    // 10. Run
-    log.info("entering VM run loop", .{});
-    try runLoop(&vcpu, &serial, &vm, &mem, &devices, device_count, snap_opts, null);
-}
-
-/// Boot a VM and run a post-boot API server for pause/resume/snapshot.
-/// The run loop executes in a spawned thread while the main thread handles
-/// API requests on the same Unix socket used for pre-boot configuration.
-fn bootVmWithApi(
-    kernel_path: [*:0]const u8,
-    initrd_path: ?[*:0]const u8,
-    cmdline_or_args: ?[*:0]const u8,
-    disk_path: ?[*:0]const u8,
-    tap_name: ?[*:0]const u8,
-    vsock_cid_str: ?[*:0]const u8,
-    vsock_uds_path: ?[*:0]const u8,
-    mem_size_mib: u32,
-    api_sock_path: []const u8,
-    io: std.Io,
-    allocator: std.mem.Allocator,
-) !void {
-    const mem_size: usize = @as(usize, mem_size_mib) * 1024 * 1024;
-    const cmdline: [*:0]const u8 = cmdline_or_args orelse DEFAULT_CMDLINE;
-
-    log.info("flint starting (API mode)", .{});
-
-    const kvm = try Kvm.open();
-    defer kvm.deinit();
-
-    const vm = try kvm.createVm();
-    defer vm.deinit();
-
-    try vm.setTssAddr(0xFFFBD000);
-    try vm.setIdentityMapAddr(0xFFFBC000);
-
-    var mem = try Memory.init(mem_size);
-    defer mem.deinit();
-    try vm.setMemoryRegion(0, 0, mem.alignedMem());
-
-    try vm.createIrqChip();
-    try vm.createPit2();
-
-    var devices: [virtio.MAX_DEVICES]?VirtioMmio = .{null} ** virtio.MAX_DEVICES;
-    const device_count = try initDevices(&devices, disk_path, tap_name, vsock_cid_str, vsock_uds_path);
-    defer for (&devices) |*d| {
-        if (d.*) |*dev| dev.deinit();
-    };
-
     var cmdline_buf: [1024]u8 = undefined;
     var effective_cmdline: [*:0]const u8 = cmdline;
     if (device_count > 0) {
@@ -324,36 +243,78 @@ fn bootVmWithApi(
 
     const vcpu_mmap_size = try kvm.getVcpuMmapSize();
     var vcpu = try vm.createVcpu(0, vcpu_mmap_size);
-    defer vcpu.deinit();
+    errdefer vcpu.deinit();
 
     var cpuid = try kvm.getSupportedCpuid();
     try vcpu.setCpuid(&cpuid);
     try setupRegisters(&vcpu, boot, &mem);
 
-    var serial = Serial.init(1);
-
-    // Set up runtime struct shared between run loop and API threads
-    var runtime = VmRuntime{
-        .vcpu = &vcpu,
-        .vm = &vm,
-        .mem = &mem,
-        .serial = &serial,
-        .devices = &devices,
+    return .{
+        .kvm = kvm,
+        .vm = vm,
+        .mem = mem,
+        .vcpu = vcpu,
+        .serial = Serial.init(1),
+        .devices = devices,
         .device_count = device_count,
+    };
+}
+
+fn bootVm(
+    kernel_path: [*:0]const u8,
+    initrd_path: ?[*:0]const u8,
+    cmdline_or_args: ?[*:0]const u8,
+    disk_path: ?[*:0]const u8,
+    tap_name: ?[*:0]const u8,
+    vsock_cid_str: ?[*:0]const u8,
+    vsock_uds_path: ?[*:0]const u8,
+    mem_size_mib: u32,
+    snap_opts: SnapshotOpts,
+) !void {
+    log.info("flint starting", .{});
+    var c_ = try createVmComponents(kernel_path, initrd_path, cmdline_or_args, disk_path, tap_name, vsock_cid_str, vsock_uds_path, mem_size_mib);
+    defer c_.deinit();
+
+    log.info("entering VM run loop", .{});
+    try runLoop(&c_.vcpu, &c_.serial, &c_.vm, &c_.mem, &c_.devices, c_.device_count, snap_opts, null);
+}
+
+/// Boot a VM and run a post-boot API server for pause/resume/snapshot.
+/// The run loop executes in a spawned thread while the main thread handles
+/// API requests on the same Unix socket used for pre-boot configuration.
+fn bootVmWithApi(
+    kernel_path: [*:0]const u8,
+    initrd_path: ?[*:0]const u8,
+    cmdline_or_args: ?[*:0]const u8,
+    disk_path: ?[*:0]const u8,
+    tap_name: ?[*:0]const u8,
+    vsock_cid_str: ?[*:0]const u8,
+    vsock_uds_path: ?[*:0]const u8,
+    mem_size_mib: u32,
+    api_sock_path: []const u8,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+) !void {
+    log.info("flint starting (API mode)", .{});
+    var c_ = try createVmComponents(kernel_path, initrd_path, cmdline_or_args, disk_path, tap_name, vsock_cid_str, vsock_uds_path, mem_size_mib);
+    defer c_.deinit();
+
+    var runtime = VmRuntime{
+        .vcpu = &c_.vcpu,
+        .vm = &c_.vm,
+        .mem = &c_.mem,
+        .serial = &c_.serial,
+        .devices = &c_.devices,
+        .device_count = c_.device_count,
         .snap_opts = .{},
     };
 
-    // Spawn run loop in a background thread.
-    // Detached because the main thread blocks in accept() and may not
-    // notice the VM exited until a client connects. When the run loop
-    // exits, it logs the reason; the process will exit when main returns.
     log.info("entering VM run loop (API mode)", .{});
     const thread = std.Thread.spawn(.{}, runLoopThread, .{&runtime}) catch |err| {
         log.err("failed to spawn run loop thread: {}", .{err});
         return error.ThreadSpawnFailed;
     };
 
-    // Main thread: run post-boot API server until VM exits
     api.servePostBoot(api_sock_path, io, allocator, &runtime) catch |err| {
         log.err("post-boot API error: {}", .{err});
     };
@@ -603,14 +564,12 @@ fn runLoop(vcpu: *Vcpu, serial: *Serial, vm: *const Vm, mem: *Memory, devices: *
                 if (rt.paused.load(.acquire)) {
                     rt.ack_paused.store(true, .release);
                     log.info("vCPU paused by API request", .{});
-                    // Spin until unpaused — the API thread will clear the flag
-                    // after finishing its operation (snapshot, inspection, etc.)
+                    // Spin until unpaused — the API resume handler clears
+                    // ack_paused then paused, so we just watch paused here
                     while (rt.paused.load(.acquire)) {
                         std.atomic.spinLoopHint();
                     }
-                    rt.ack_paused.store(false, .release);
                     log.info("vCPU resumed", .{});
-                    // Clear immediate_exit so next KVM_RUN proceeds normally
                     vcpu.kvm_run.immediate_exit = 0;
                     continue;
                 }

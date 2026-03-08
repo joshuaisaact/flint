@@ -141,6 +141,16 @@ Added post-boot API server with VmRuntime struct + atomic pause mechanism.
 ### Step 8: Tests (tests.zig) ✅
 Serial snapshot round-trip, queue snapshot round-trip, header validation.
 
+### Step 9: Review hardening ✅
+Fixed concurrency and code quality issues found via three-agent review:
+- Pause TOCTOU: cmpxchgStrong for atomic state transitions (no concurrent pause race)
+- ack_paused stale: API resume handler clears ack before releasing paused
+- Store ordering: immediate_exit written before paused release-store
+- readBody memory leak: readSliceAll into caller buffer instead of readAlloc
+- Silent path truncation: reject paths >= 256 bytes with 400 error
+- Code duplication: VmComponents struct + createVmComponents() eliminates ~70 duplicate lines
+- Socket setup: listenUnix() helper deduplicates serve/servePostBoot
+
 ## Files to Create/Modify
 
 | File | Action | What |
@@ -165,7 +175,8 @@ Serial snapshot round-trip, queue snapshot round-trip, header validation.
 - Vsock connections are NOT saved (ephemeral)
 - Reset kvm_run.immediate_exit = 0 before re-entering run loop after pause
 - Use raw linux syscalls for file I/O (consistent with rest of codebase)
-- Zig 0.16 atomics: std.atomic.Value(bool), load(.acquire), store(.release)
+- Zig 0.16 atomics: std.atomic.Value(bool), load(.acquire), store(.release), cmpxchgStrong(.acq_rel, .acquire)
+- Zig 0.16 http reader: readerExpectNone returns *Reader with readSliceAll (no readAll method)
 - kvm_irqchip has an opaque union in Zig's cImport — use raw [520]u8 and hardcoded ioctl numbers
 - packed struct can't contain [N]u8 arrays in Zig — use manual serialization for snapshot header
 - Zig test runner treats any std.log.err as a test failure — use log.warn for expected error paths
