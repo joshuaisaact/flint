@@ -4,6 +4,7 @@
 const std = @import("std");
 const abi = @import("abi.zig");
 const c = abi.c;
+const Kvm = @import("system.zig");
 
 const log = std.log.scoped(.vcpu);
 
@@ -13,16 +14,9 @@ fd: std.posix.fd_t,
 kvm_run: *volatile c.kvm_run,
 kvm_run_mmap_size: usize,
 
-pub fn create(vm_fd: std.posix.fd_t, vcpu_id: u32) !Self {
+pub fn create(vm_fd: std.posix.fd_t, vcpu_id: u32, mmap_size: usize) !Self {
     const fd: i32 = @intCast(try abi.ioctl(vm_fd, c.KVM_CREATE_VCPU, vcpu_id));
-
-    // Get mmap size -- need a /dev/kvm fd for this system-level ioctl
-    const kvm_fd = std.posix.openat(std.posix.AT.FDCWD, "/dev/kvm", .{
-        .ACCMODE = .RDWR,
-        .CLOEXEC = true,
-    }, 0) catch return error.KvmUnavailable;
-    defer abi.close(kvm_fd);
-    const mmap_size = try abi.ioctl(kvm_fd, c.KVM_GET_VCPU_MMAP_SIZE, 0);
+    errdefer abi.close(fd);
 
     const mapped = std.posix.mmap(
         null,
@@ -87,8 +81,6 @@ pub fn getIoData(self: Self) IoExit {
         .data = base + io.data_offset,
     };
 }
-
-const Kvm = @import("system.zig");
 
 pub fn setCpuid(self: Self, cpuid: *Kvm.CpuidBuffer) !void {
     try abi.ioctlVoid(self.fd, c.KVM_SET_CPUID2, @intFromPtr(cpuid));

@@ -54,9 +54,17 @@ pub const E820Entry = packed struct {
 /// write individual fields at known offsets.
 pub const BOOT_PARAMS_SIZE = 4096;
 
-// Offsets within boot_params
+// Offsets within boot_params (the 4KB zero page)
 pub const OFF_E820_ENTRIES = 0x1E8; // u8: number of e820 entries
 pub const OFF_SETUP_HEADER = 0x1F1; // setup header starts here
+pub const OFF_TYPE_OF_LOADER = 0x210;
+pub const OFF_LOADFLAGS = 0x211;
+pub const OFF_RAMDISK_IMAGE = 0x218;
+pub const OFF_RAMDISK_SIZE = 0x21C;
+pub const OFF_HEAP_END_PTR = 0x224;
+pub const OFF_CMD_LINE_PTR = 0x228;
+pub const OFF_INITRD_ADDR_MAX = 0x22C;
+pub const OFF_XLOADFLAGS = 0x236;
 pub const OFF_E820_TABLE = 0x2D0; // e820 table (array of E820Entry, max 128)
 
 // Well-known guest physical addresses for the Linux boot protocol
@@ -64,9 +72,15 @@ pub const BOOT_PARAMS_ADDR: u32 = 0x7000;
 pub const CMDLINE_ADDR: u32 = 0x20000;
 pub const KERNEL_ADDR: u32 = 0x100000; // 1MB - where protected-mode kernel is loaded
 
+/// 64-bit entry point offset from start of protected-mode kernel
+pub const STARTUP_64_OFFSET: u32 = 0x200;
+
 /// Load flags
 pub const LOADED_HIGH: u8 = 0x01;
 pub const CAN_USE_HEAP: u8 = 0x80;
+
+/// xloadflags
+pub const XLF_KERNEL_64: u16 = 0x01;
 
 /// "HdrS" magic
 pub const HDRS_MAGIC: u32 = 0x53726448;

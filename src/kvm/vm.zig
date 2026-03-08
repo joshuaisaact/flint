@@ -36,8 +36,19 @@ pub fn setMemoryRegion(self: Self, slot: u32, guest_phys_addr: u64, memory: []al
 }
 
 /// Create a vCPU with the given ID.
-pub fn createVcpu(self: Self, vcpu_id: u32) !Vcpu {
-    return Vcpu.create(self.fd, vcpu_id);
+pub fn createVcpu(self: Self, vcpu_id: u32, vcpu_mmap_size: usize) !Vcpu {
+    return Vcpu.create(self.fd, vcpu_id, vcpu_mmap_size);
+}
+
+/// Set TSS address (required on Intel before running vCPUs).
+pub fn setTssAddr(self: Self, addr: u32) !void {
+    try abi.ioctlVoid(self.fd, c.KVM_SET_TSS_ADDR, addr);
+}
+
+/// Set identity map address (required on Intel).
+pub fn setIdentityMapAddr(self: Self, addr: u64) !void {
+    var a = addr;
+    try abi.ioctlVoid(self.fd, c.KVM_SET_IDENTITY_MAP_ADDR, @intFromPtr(&a));
 }
 
 /// Create the in-kernel IRQ chip (PIC + IOAPIC).
@@ -56,9 +67,8 @@ pub fn createPit2(self: Self) !void {
 
 /// Inject an IRQ line level change.
 pub fn setIrqLine(self: Self, irq: u32, level: u32) !void {
-    var irq_level = c.kvm_irq_level{
-        .irq = irq,
-        .level = level,
-    };
+    var irq_level: c.kvm_irq_level = .{};
+    irq_level.unnamed_0.irq = irq;
+    irq_level.level = level;
     try abi.ioctlVoid(self.fd, c.KVM_IRQ_LINE, @intFromPtr(&irq_level));
 }

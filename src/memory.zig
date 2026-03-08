@@ -35,13 +35,15 @@ pub fn size(self: Self) usize {
 
 /// Get a slice of guest memory starting at the given guest physical address.
 pub fn slice(self: Self, guest_addr: usize, len: usize) ![]u8 {
-    if (guest_addr + len > self.mem.len) return error.GuestMemoryOutOfBounds;
+    const end = std.math.add(usize, guest_addr, len) catch return error.GuestMemoryOutOfBounds;
+    if (end > self.mem.len) return error.GuestMemoryOutOfBounds;
     return self.mem[guest_addr..][0..len];
 }
 
 /// Get a pointer to a struct at the given guest physical address.
 pub fn ptrAt(self: Self, comptime T: type, guest_addr: usize) !*T {
-    if (guest_addr + @sizeOf(T) > self.mem.len) return error.GuestMemoryOutOfBounds;
+    const end = std.math.add(usize, guest_addr, @sizeOf(T)) catch return error.GuestMemoryOutOfBounds;
+    if (end > self.mem.len) return error.GuestMemoryOutOfBounds;
     if (guest_addr % @alignOf(T) != 0) return error.GuestMemoryMisaligned;
     return @ptrCast(@alignCast(&self.mem[guest_addr]));
 }

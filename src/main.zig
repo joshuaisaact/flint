@@ -7,6 +7,7 @@ const loader = @import("boot/loader.zig");
 const Serial = @import("devices/serial.zig");
 const abi = @import("kvm/abi.zig");
 const c = abi.c;
+const boot_params = @import("boot/params.zig");
 
 const log = std.log.scoped(.flint);
 
@@ -18,14 +19,26 @@ pub fn main(init: std.process.Init.Minimal) !void {
     _ = args.skip(); // program name
 
     const kernel_path = args.next() orelse {
-        std.debug.print("usage: flint <kernel-bzimage> [command line]\n", .{});
+        std.debug.print("usage: flint <kernel-bzimage> [initrd] [command line]\n", .{});
         std.process.exit(1);
     };
 
-    const cmdline = args.next() orelse DEFAULT_CMDLINE;
+    // Second arg is initrd if it doesn't look like a cmdline (heuristic: cmdlines contain '=')
+    const second = args.next();
+    const initrd_path: ?[*:0]const u8, const cmdline: [*:0]const u8 = blk: {
+        if (second) |s| {
+            const len = std.mem.indexOfSentinel(u8, 0, s);
+            if (std.mem.indexOfScalar(u8, s[0..len], '=') != null) {
+                break :blk .{ null, s }; // it's a cmdline
+            }
+            break :blk .{ s, args.next() orelse DEFAULT_CMDLINE };
+        }
+        break :blk .{ null, DEFAULT_CMDLINE };
+    };
 
     log.info("flint starting", .{});
     log.info("kernel: {s}", .{kernel_path});
+    if (initrd_path) |p| log.info("initrd: {s}", .{p});
     log.info("cmdline: {s}", .{cmdline});
 
     // 1. Open KVM
@@ -36,22 +49,26 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const vm = try kvm.createVm();
     defer vm.deinit();
 
-    // 3. Set up guest memory
+    // 3. Set up Intel-required addresses (harmless on AMD)
+    try vm.setTssAddr(0xFFFBD000);
+    try vm.setIdentityMapAddr(0xFFFBC000);
+
+    // 4. Set up guest memory
     var mem = try Memory.init(DEFAULT_MEM_SIZE);
     defer mem.deinit();
 
     try vm.setMemoryRegion(0, 0, mem.alignedMem());
 
-    // 4. Create in-kernel devices
+    // 5. Create in-kernel devices
     try vm.createIrqChip();
     try vm.createPit2();
 
-    // 5. Load the kernel
-    // kernel_path is a [:0]const u8 from args iterator
-    const boot = try loader.loadBzImage(&mem, kernel_path, cmdline);
+    // 6. Load the kernel (and initrd if provided)
+    const boot = try loader.loadBzImage(&mem, kernel_path, initrd_path, cmdline);
 
-    // 6. Create vCPU and set up registers
-    var vcpu = try vm.createVcpu(0);
+    // 7. Create vCPU and set up registers
+    const vcpu_mmap_size = try kvm.getVcpuMmapSize();
+    var vcpu = try vm.createVcpu(0, vcpu_mmap_size);
     defer vcpu.deinit();
 
     // Set CPUID (passthrough host CPU features so kernel sees APIC, TSC, etc.)
@@ -60,46 +77,56 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     try setupRegisters(&vcpu, boot, &mem);
 
-    // 7. Set up devices
+    // 8. Set up devices
     var serial = Serial.init(1); // stdout fd
 
-    // 8. Run
+    // 9. Run
     log.info("entering VM run loop", .{});
-
-    try runLoop(&vcpu, &serial);
+    try runLoop(&vcpu, &serial, &vm);
 }
 
 // Memory layout for boot structures (all below boot_params at 0x7000)
-// Each page table is 4KB (0x1000)
-const GDT_ADDR: u64 = 0x500; // GDT is small, fits in 256 bytes starting at 0x500
+const GDT_ADDR: u64 = 0x500;
 const PML4_ADDR: u64 = 0x1000;
 const PDPT_ADDR: u64 = 0x2000;
-const PD_BASE_ADDR: u64 = 0x3000; // 4 PD tables: 0x3000, 0x4000, 0x5000, 0x6000
+const STACK_ADDR: u64 = 0x8000; // above boot_params, grows down into 0x3000-0x7FFF
+
+// x86-64 control register bits
+const CR0_PE: u64 = 1 << 0; // Protected Mode Enable
+const CR0_PG: u64 = 1 << 31; // Paging
+const CR4_PAE: u64 = 1 << 5; // Physical Address Extension
+const EFER_SCE: u64 = 1 << 0; // SYSCALL Enable
+const EFER_LME: u64 = 1 << 8; // Long Mode Enable
+const EFER_LMA: u64 = 1 << 10; // Long Mode Active
+const EFER_NXE: u64 = 1 << 11; // No-Execute Enable
+
+// Page table entry flags
+const PTE_PRESENT: u64 = 1 << 0;
+const PTE_WRITABLE: u64 = 1 << 1;
+const PTE_HUGE: u64 = 1 << 7; // 1GB page in PDPT
 
 fn setupRegisters(vcpu: *Vcpu, boot: loader.LoadResult, mem: *Memory) !void {
     // Write a GDT with 64-bit code segment
     // Entry 0: null
     // Entry 1 (0x08): 64-bit code segment
-    // Entry 2 (0x10): 64-bit code segment (also at 0x10 for compatibility)
+    // Entry 2 (0x10): 64-bit code segment (Linux expects CS=0x10)
     // Entry 3 (0x18): data segment
     const gdt = [4]u64{
         0x0000000000000000, // null
         0x00AF9B000000FFFF, // 64-bit code: L=1, D=0, P=1, DPL=0, type=0xB
-        0x00AF9B000000FFFF, // 64-bit code (duplicate for selector 0x10)
+        0x00AF9B000000FFFF, // 64-bit code (duplicate at selector 0x10)
         0x00CF93000000FFFF, // data: base=0, limit=4G, P=1, DPL=0, type=0x3
     };
     try mem.write(@intCast(GDT_ADDR), std.mem.asBytes(&gdt));
 
-    // Set up identity-mapped page tables for first 512GB
-    // PML4[0] -> PDPT
+    // Set up identity-mapped page tables for first 512GB using 1GB huge pages
     const pml4 = try mem.ptrAt([512]u64, @intCast(PML4_ADDR));
     @memset(pml4, 0);
-    pml4[0] = PDPT_ADDR | 0x3; // present + writable
+    pml4[0] = PDPT_ADDR | PTE_PRESENT | PTE_WRITABLE;
 
-    // PDPT: 512 entries mapping 0-512GB using 1GB huge pages
     const pdpt = try mem.ptrAt([512]u64, @intCast(PDPT_ADDR));
     for (0..512) |i| {
-        pdpt[i] = (i * 0x40000000) | 0x83; // present + writable + huge (1GB page)
+        pdpt[i] = (i * 0x40000000) | PTE_PRESENT | PTE_WRITABLE | PTE_HUGE;
     }
 
     var sregs = try vcpu.getSregs();
@@ -133,38 +160,34 @@ fn setupRegisters(vcpu: *Vcpu, boot: loader.LoadResult, mem: *Memory) !void {
         seg.g = 1;
     }
 
-    // Enable long mode:
-    // CR0: PE (protected mode) + PG (paging)
-    sregs.cr0 = 0x80000001;
-    // CR4: PAE (required for long mode)
-    sregs.cr4 = 0x20;
-    // CR3: page table root
+    // Enable long mode
+    sregs.cr0 = CR0_PE | CR0_PG;
+    sregs.cr4 = CR4_PAE;
     sregs.cr3 = PML4_ADDR;
-    // EFER: SCE (bit 0) + LME (bit 8) + LMA (bit 10) + NXE (bit 11)
-    sregs.efer = 0xD01;
+    sregs.efer = EFER_SCE | EFER_LME | EFER_LMA | EFER_NXE;
 
     try vcpu.setSregs(&sregs);
 
     // Set up general registers
     var regs = std.mem.zeroes(c.kvm_regs);
-    regs.rip = boot.entry_addr + 0x200; // startup_64 entry point
+    regs.rip = boot.entry_addr + boot_params.STARTUP_64_OFFSET;
     regs.rsi = boot.boot_params_addr;
-    regs.rflags = 0x2;
-    regs.rsp = 0x7C00;
+    regs.rflags = 0x2; // reserved bit 1 must be set
+    regs.rsp = STACK_ADDR;
 
     try vcpu.setRegs(&regs);
 
-    log.info("registers configured: rip=0x{x} (64-bit entry) rsi=0x{x}", .{ regs.rip, regs.rsi });
+    log.info("registers configured: rip=0x{x} (startup_64) rsi=0x{x}", .{ regs.rip, regs.rsi });
 }
 
-fn runLoop(vcpu: *Vcpu, serial: *Serial) !void {
+fn runLoop(vcpu: *Vcpu, serial: *Serial, vm: *const Vm) !void {
     var exit_count: u64 = 0;
     while (true) {
         const exit_reason = vcpu.run() catch |err| {
             log.err("KVM_RUN failed: {}", .{err});
             return err;
         };
-        exit_count += 1;
+        exit_count +%= 1;
 
         switch (exit_reason) {
             c.KVM_EXIT_IO => {
@@ -177,8 +200,10 @@ fn runLoop(vcpu: *Vcpu, serial: *Serial) !void {
                         const offset = i * io.size;
                         serial.handleIo(io.port, io.data[offset..][0..io.size], is_write);
                     }
-                } else if (exit_count < 20) {
-                    log.debug("IO port=0x{x} dir={} size={}", .{ io.port, io.direction, io.size });
+                    if (serial.hasPendingIrq()) {
+                        vm.setIrqLine(Serial.IRQ, 1) catch |err| log.warn("setIrqLine: {}", .{err});
+                        vm.setIrqLine(Serial.IRQ, 0) catch |err| log.warn("setIrqLine: {}", .{err});
+                    }
                 }
             },
             c.KVM_EXIT_HLT => {
@@ -210,10 +235,7 @@ fn runLoop(vcpu: *Vcpu, serial: *Serial) !void {
                 return error.VmInternalError;
             },
             c.KVM_EXIT_MMIO => {
-                const mmio = vcpu.kvm_run.unnamed_0.mmio;
-                if (exit_count < 20) {
-                    log.info("MMIO: addr=0x{x} len={} is_write={}", .{ mmio.phys_addr, mmio.len, mmio.is_write });
-                }
+                // Silently ignore unhandled MMIO (guest probing non-existent devices)
             },
             else => {
                 log.warn("unhandled exit reason: {}", .{exit_reason});
