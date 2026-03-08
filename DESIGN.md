@@ -31,7 +31,7 @@ A lightweight, production-grade Virtual Machine Monitor (VMM) using KVM, written
 3. **Generic ioctl helper** -- eliminate repetitive errno checking at every call site
 4. **Tagged union device dispatch** -- not vtables, not linear scan of function pointers
 5. **`@cImport` for KVM ABI** -- import kernel headers directly for ioctl constants/structs
-6. **Hand-written boot_params** -- only the fields we actually use, not the whole C header
+6. **Hand-written boot_params** -- packed structs for on-wire layout, named constants for byte offsets
 7. **Comptime arch dispatch** -- start x86-only but structure for future multi-arch
 8. **Tests from day one** -- at minimum for boot param setup and device register logic
 9. **`unreachable` never for guest IO** -- log and ignore unknown accesses
@@ -49,23 +49,30 @@ A lightweight, production-grade Virtual Machine Monitor (VMM) using KVM, written
 
 ```
 src/
-  main.zig          -- entry point, arg parsing, orchestration
+  main.zig          -- entry point, arg parsing, register setup, run loop
+  memory.zig        -- guest physical memory management (mmap regions)
+  tests.zig         -- unit tests
   kvm/
     abi.zig         -- @cImport("linux/kvm.h") + ioctl helper
-    system.zig      -- Kvm (system fd wrapper)
-    vm.zig          -- Vm (VM fd wrapper)
-    vcpu.zig        -- Vcpu (vCPU fd wrapper + run loop)
+    system.zig      -- Kvm (system fd, CPUID, capabilities)
+    vm.zig          -- Vm (VM fd, memory regions, IRQ chip, PIT, TSS)
+    vcpu.zig        -- Vcpu (vCPU fd, registers, CPUID, run)
   boot/
-    params.zig      -- boot_params extern structs (hand-written, minimal)
-    loader.zig      -- kernel + initrd loading into guest memory
+    params.zig      -- boot protocol constants and packed structs
+    loader.zig      -- bzImage + initrd loading into guest memory
   devices/
-    device.zig      -- Device tagged union + IO dispatch
-    serial.zig      -- 16550A UART emulation
-  arch/
-    index.zig       -- comptime arch selector
-    x86/
-      setup.zig     -- x86 VM init, register setup, CPUID
-  memory.zig        -- guest physical memory management (mmap regions)
+    serial.zig      -- 16550 UART emulation (COM1, IRQ 4)
+```
+
+Planned additions for Phase 3:
+```
+  devices/
+    device.zig      -- Device tagged union + IO/MMIO dispatch bus
+    virtio/
+      mmio.zig      -- virtio-mmio transport
+      block.zig     -- virtio-blk device
+      net.zig       -- virtio-net device
+      queue.zig     -- virtqueue implementation
 ```
 
 ### Device emulation via tagged union
@@ -100,26 +107,37 @@ Small, closed, known-at-comptime set. `inline else` generates per-variant dispat
 
 ## Build phases
 
-### Phase 1: Boot to serial output
+### Phase 1: Boot to serial output -- DONE
 - KVM ioctl wrapper (create VM, vCPU, memory regions)
 - Load a Linux kernel (bzImage)
 - Set up boot_params + initial registers
 - vCPU run loop handling IO exits
 - Serial port emulation (print to stdout)
-- **Target: ~500 lines, see "Linux version ..." from inside a VM**
-
-### Phase 2: Boot a real kernel
-- Full bzImage loader (parse setup header, protocol versions)
-- Command line passing
-- initrd loading
-- Proper CPUID/MSR setup
+- 64-bit long mode entry (PML4 page tables, EFER, startup_64)
+- CPUID passthrough (KVM_GET_SUPPORTED_CPUID / KVM_SET_CPUID2)
 - In-kernel IRQCHIP + PIT
+- **Result: Linux 6.8.0-31-generic boots to VFS panic in ~1 second**
 
-### Phase 3: Storage + networking
+### Phase 2: Boot to userspace -- DONE
+- initrd loading (placed high in RAM, page-aligned, respects initrd_addr_max)
+- Serial TX interrupt support (IER/IIR + IRQ 4 injection via KVM_IRQ_LINE)
+- Intel compatibility (KVM_SET_TSS_ADDR / KVM_SET_IDENTITY_MAP_ADDR)
+- xloadflags validation for 64-bit entry
+- Overflow-safe guest memory bounds checks
+- Malicious bzImage hardening (setup_sects bounds check)
+- E820 map with proper VGA/ROM hole coverage
+- Named constants for all boot protocol offsets and control register bits
+- 18 unit tests (memory, boot params, serial)
+- **Result: boots to busybox initramfs, runs shell scripts, ~1 second to userspace**
+
+### Phase 3: Storage + networking -- NEXT
 - virtio-mmio transport layer
 - virtio-block (backed by a file)
 - virtio-net (backed by TAP device, vhost-net acceleration)
 - `ioeventfd`/`irqfd` for kernel-bypass notifications
+- Device bus abstraction (tagged union dispatch for IO/MMIO)
+- MMIO exit handling in run loop
+- Memory region split around MMIO gap
 
 ### Phase 4: Production concerns
 - REST API server (Unix socket, JSON)
@@ -129,6 +147,8 @@ Small, closed, known-at-comptime set. `inline else` generates per-variant dispat
 - VM snapshotting / restore
 - vsock support
 - Metrics / logging
+- CPUID filtering (topology, HYPERVISOR bit, VMX/SMX)
+- Multi-vCPU support (thread per vCPU, mutex on shared device state)
 
 ## What Firecracker has that existing Zig VMMs don't
 
