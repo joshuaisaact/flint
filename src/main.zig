@@ -20,6 +20,32 @@ const SnapshotOpts = struct {
     mem_path: ?[*:0]const u8 = null,
 };
 
+/// Live VM state shared between the run loop thread and the API server thread.
+/// The API server sets `paused` + `immediate_exit` to safely stop the vCPU
+/// before performing operations like snapshotting that require the vCPU to
+/// not be in KVM_RUN.
+pub const VmRuntime = struct {
+    vcpu: *Vcpu,
+    vm: *const Vm,
+    mem: *Memory,
+    serial: *Serial,
+    devices: *DeviceArray,
+    device_count: u32,
+    snap_opts: SnapshotOpts,
+
+    // Pause mechanism: API thread sets paused=true and immediate_exit=1.
+    // KVM_RUN returns -EINTR, run loop sees paused=true and spins on
+    // the flag. API thread does its work, then sets paused=false.
+    paused: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    // Set by the run loop when it has actually stopped executing guest code.
+    // The API thread polls this after setting paused=true to confirm the
+    // vCPU is safe to inspect.
+    ack_paused: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    // Set by the run loop when the guest exits (halt/shutdown/error).
+    // Tells the API thread to stop accepting connections.
+    exited: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+};
+
 const DEFAULT_MEM_SIZE = 512 * 1024 * 1024; // 512 MB
 const DEFAULT_CMDLINE = "earlyprintk=serial,ttyS0,115200 console=ttyS0 nokaslr reboot=k panic=1 pci=off nomodules";
 
@@ -98,7 +124,7 @@ pub fn main(init: std.process.Init) !void {
         // Restore mode: rebuild VM from snapshot files, no kernel load
         try restoreVm(vmstate_path, mem_snap_path, disk_path, tap_name, vsock_cid, vsock_uds);
     } else if (api_sock) |sock| {
-        // API mode: listen for configuration, then boot
+        // API mode: pre-boot config phase, then boot, then post-boot API
         const sock_len = std.mem.indexOfSentinel(u8, 0, sock);
         const config = try api.serve(sock[0..sock_len], init.io, init.gpa);
         const kp: [*:0]const u8 = config.kernel_path.?.ptr;
@@ -108,7 +134,7 @@ pub fn main(init: std.process.Init) !void {
         const tn: ?[*:0]const u8 = if (config.tap_name) |p| p.ptr else null;
         const vc: ?[*:0]const u8 = if (config.vsock_cid) |p| p.ptr else null;
         const vu: ?[*:0]const u8 = if (config.vsock_uds) |p| p.ptr else null;
-        try bootVm(kp, ip, ba, dp, tn, vc, vu, config.mem_size_mib, .{});
+        try bootVmWithApi(kp, ip, ba, dp, tn, vc, vu, config.mem_size_mib, sock[0..sock_len], init.io, init.gpa);
     } else if (kernel_path) |kp| {
         // CLI mode: boot directly from args
         const snap_opts: SnapshotOpts = if (save_on_halt) .{
@@ -226,7 +252,113 @@ fn bootVm(
 
     // 10. Run
     log.info("entering VM run loop", .{});
-    try runLoop(&vcpu, &serial, &vm, &mem, &devices, device_count, snap_opts);
+    try runLoop(&vcpu, &serial, &vm, &mem, &devices, device_count, snap_opts, null);
+}
+
+/// Boot a VM and run a post-boot API server for pause/resume/snapshot.
+/// The run loop executes in a spawned thread while the main thread handles
+/// API requests on the same Unix socket used for pre-boot configuration.
+fn bootVmWithApi(
+    kernel_path: [*:0]const u8,
+    initrd_path: ?[*:0]const u8,
+    cmdline_or_args: ?[*:0]const u8,
+    disk_path: ?[*:0]const u8,
+    tap_name: ?[*:0]const u8,
+    vsock_cid_str: ?[*:0]const u8,
+    vsock_uds_path: ?[*:0]const u8,
+    mem_size_mib: u32,
+    api_sock_path: []const u8,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+) !void {
+    const mem_size: usize = @as(usize, mem_size_mib) * 1024 * 1024;
+    const cmdline: [*:0]const u8 = cmdline_or_args orelse DEFAULT_CMDLINE;
+
+    log.info("flint starting (API mode)", .{});
+
+    const kvm = try Kvm.open();
+    defer kvm.deinit();
+
+    const vm = try kvm.createVm();
+    defer vm.deinit();
+
+    try vm.setTssAddr(0xFFFBD000);
+    try vm.setIdentityMapAddr(0xFFFBC000);
+
+    var mem = try Memory.init(mem_size);
+    defer mem.deinit();
+    try vm.setMemoryRegion(0, 0, mem.alignedMem());
+
+    try vm.createIrqChip();
+    try vm.createPit2();
+
+    var devices: [virtio.MAX_DEVICES]?VirtioMmio = .{null} ** virtio.MAX_DEVICES;
+    const device_count = try initDevices(&devices, disk_path, tap_name, vsock_cid_str, vsock_uds_path);
+    defer for (&devices) |*d| {
+        if (d.*) |*dev| dev.deinit();
+    };
+
+    var cmdline_buf: [1024]u8 = undefined;
+    var effective_cmdline: [*:0]const u8 = cmdline;
+    if (device_count > 0) {
+        var pos: usize = 0;
+        const base_cmdline = cmdline[0..std.mem.indexOfSentinel(u8, 0, cmdline)];
+        if (base_cmdline.len >= cmdline_buf.len) return error.CmdlineTooLong;
+        @memcpy(cmdline_buf[pos..][0..base_cmdline.len], base_cmdline);
+        pos += base_cmdline.len;
+        for (0..device_count) |i| {
+            if (devices[i]) |dev| {
+                const entry = std.fmt.bufPrint(cmdline_buf[pos..], " virtio_mmio.device=4K@0x{x}:{d}", .{
+                    dev.mmio_base, dev.irq,
+                }) catch return error.CmdlineTooLong;
+                pos += entry.len;
+            }
+        }
+        if (pos < cmdline_buf.len) {
+            cmdline_buf[pos] = 0;
+            effective_cmdline = @ptrCast(&cmdline_buf);
+        }
+    }
+
+    const boot = try loader.loadBzImage(&mem, kernel_path, initrd_path, effective_cmdline);
+
+    const vcpu_mmap_size = try kvm.getVcpuMmapSize();
+    var vcpu = try vm.createVcpu(0, vcpu_mmap_size);
+    defer vcpu.deinit();
+
+    var cpuid = try kvm.getSupportedCpuid();
+    try vcpu.setCpuid(&cpuid);
+    try setupRegisters(&vcpu, boot, &mem);
+
+    var serial = Serial.init(1);
+
+    // Set up runtime struct shared between run loop and API threads
+    var runtime = VmRuntime{
+        .vcpu = &vcpu,
+        .vm = &vm,
+        .mem = &mem,
+        .serial = &serial,
+        .devices = &devices,
+        .device_count = device_count,
+        .snap_opts = .{},
+    };
+
+    // Spawn run loop in a background thread.
+    // Detached because the main thread blocks in accept() and may not
+    // notice the VM exited until a client connects. When the run loop
+    // exits, it logs the reason; the process will exit when main returns.
+    log.info("entering VM run loop (API mode)", .{});
+    const thread = std.Thread.spawn(.{}, runLoopThread, .{&runtime}) catch |err| {
+        log.err("failed to spawn run loop thread: {}", .{err});
+        return error.ThreadSpawnFailed;
+    };
+
+    // Main thread: run post-boot API server until VM exits
+    api.servePostBoot(api_sock_path, io, allocator, &runtime) catch |err| {
+        log.err("post-boot API error: {}", .{err});
+    };
+
+    thread.join();
 }
 
 /// Restore a VM from snapshot files instead of booting a kernel.
@@ -292,7 +424,7 @@ fn restoreVm(
 
     // 6. Enter run loop — guest resumes execution from where it was paused
     log.info("entering VM run loop (restored)", .{});
-    try runLoop(&vcpu, &serial, &vm, &mem, &devices, device_count, .{});
+    try runLoop(&vcpu, &serial, &vm, &mem, &devices, device_count, .{}, null);
 }
 
 // Memory layout for boot structures (all below boot_params at 0x7000)
@@ -444,10 +576,45 @@ fn initDevices(
     return device_count;
 }
 
-fn runLoop(vcpu: *Vcpu, serial: *Serial, vm: *const Vm, mem: *Memory, devices: *DeviceArray, device_count: u32, snap_opts: SnapshotOpts) !void {
+/// Thread entry point for run loop when running alongside the API server.
+fn runLoopThread(runtime: *VmRuntime) void {
+    runLoop(
+        runtime.vcpu,
+        runtime.serial,
+        runtime.vm,
+        runtime.mem,
+        runtime.devices,
+        runtime.device_count,
+        runtime.snap_opts,
+        runtime,
+    ) catch |err| {
+        log.err("run loop exited with error: {}", .{err});
+    };
+    runtime.exited.store(true, .release);
+}
+
+fn runLoop(vcpu: *Vcpu, serial: *Serial, vm: *const Vm, mem: *Memory, devices: *DeviceArray, device_count: u32, snap_opts: SnapshotOpts, runtime: ?*VmRuntime) !void {
     var exit_count: u64 = 0;
     while (true) {
         const exit_reason = vcpu.run() catch |err| {
+            // immediate_exit causes KVM_RUN to return -EINTR (VmRunFailed).
+            // Check if this was a pause request from the API thread.
+            if (runtime) |rt| {
+                if (rt.paused.load(.acquire)) {
+                    rt.ack_paused.store(true, .release);
+                    log.info("vCPU paused by API request", .{});
+                    // Spin until unpaused — the API thread will clear the flag
+                    // after finishing its operation (snapshot, inspection, etc.)
+                    while (rt.paused.load(.acquire)) {
+                        std.atomic.spinLoopHint();
+                    }
+                    rt.ack_paused.store(false, .release);
+                    log.info("vCPU resumed", .{});
+                    // Clear immediate_exit so next KVM_RUN proceeds normally
+                    vcpu.kvm_run.immediate_exit = 0;
+                    continue;
+                }
+            }
             log.err("KVM_RUN failed: {}", .{err});
             return err;
         };

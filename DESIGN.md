@@ -167,7 +167,8 @@ Priority order optimized for AI agent code execution sandbox use case:
    controllers, device transport state, serial) to binary vmstate file + raw memory file.
    Restore via mmap(MAP_PRIVATE) demand-paging for near-instant restore regardless of VM
    size. CLI: `--save-on-halt`, `--restore`, `--vmstate-path`, `--mem-path`.
-   API endpoints (pause/resume, snapshot create/load) still TODO.
+   Post-boot API: PATCH /vm (pause/resume), PUT /snapshot/create, GET /vm.
+   VmRuntime struct with atomic pause via `kvm_run.immediate_exit`.
 
 3. **VM pool / warm start** -- pre-fork a pool of restored VMs ready for immediate use.
    Combined with snapshots, this gives near-instant sandbox provisioning.

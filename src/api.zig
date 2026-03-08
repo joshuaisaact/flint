@@ -7,6 +7,9 @@ const Io = std.Io;
 const http = std.http;
 const json = std.json;
 
+const snapshot = @import("snapshot.zig");
+const main_mod = @import("main.zig");
+
 const log = std.log.scoped(.api);
 
 /// VM configuration accumulated from API calls.
@@ -400,6 +403,246 @@ fn respondError(request: *http.Server.Request, status: http.Status, msg: []const
 
     request.respond(body, .{
         .status = status,
+        .extra_headers = &.{
+            .{ .name = "content-type", .value = "application/json" },
+        },
+    }) catch {};
+}
+
+// --- Post-boot API ---
+// After the VM is running, this server handles live operations:
+// PATCH /vm          — pause or resume the vCPU
+// PUT /snapshot/create — save VM state to disk (VM must be paused first)
+// GET /vm            — query VM status (running/paused)
+
+const VmStateBody = struct {
+    state: []const u8, // "Paused" or "Resumed"
+};
+
+const SnapshotCreateBody = struct {
+    snapshot_type: []const u8 = "Full",
+    snapshot_path: []const u8 = "snapshot.vmstate",
+    mem_file_path: []const u8 = "snapshot.mem",
+};
+
+/// Run the post-boot API server. Accepts connections until the VM exits.
+pub fn servePostBoot(
+    sock_path: []const u8,
+    io: Io,
+    allocator: std.mem.Allocator,
+    runtime: *main_mod.VmRuntime,
+) !void {
+    // Re-bind the socket (pre-boot server closed it)
+    if (sock_path.len <= Io.net.UnixAddress.max_len) {
+        var path_buf: [Io.net.UnixAddress.max_len + 1]u8 = undefined;
+        @memcpy(path_buf[0..sock_path.len], sock_path);
+        path_buf[sock_path.len] = 0;
+        _ = std.os.linux.unlink(@ptrCast(path_buf[0..sock_path.len :0]));
+    }
+
+    const addr = try Io.net.UnixAddress.init(sock_path);
+    var server = try addr.listen(io, .{});
+    defer server.deinit(io);
+
+    log.info("post-boot API listening on {s}", .{sock_path});
+
+    while (!runtime.exited.load(.acquire)) {
+        const stream = server.accept(io) catch |err| {
+            log.err("accept failed: {}", .{err});
+            continue;
+        };
+
+        handlePostBootConnection(stream, io, allocator, runtime) catch |err| {
+            log.err("post-boot connection error: {}", .{err});
+        };
+
+        stream.close(io);
+    }
+
+    log.info("VM exited, post-boot API shutting down", .{});
+}
+
+fn handlePostBootConnection(
+    stream: Io.net.Stream,
+    io: Io,
+    allocator: std.mem.Allocator,
+    runtime: *main_mod.VmRuntime,
+) !void {
+    var read_buf: [8192]u8 = undefined;
+    var write_buf: [8192]u8 = undefined;
+    var stream_reader = stream.reader(io, &read_buf);
+    var stream_writer = stream.writer(io, &write_buf);
+    var http_server = http.Server.init(&stream_reader.interface, &stream_writer.interface);
+
+    while (true) {
+        var request = http_server.receiveHead() catch |err| {
+            if (err == error.EndOfStream) return;
+            log.warn("receiveHead failed: {}", .{err});
+            return;
+        };
+
+        handlePostBootRequest(&request, allocator, runtime);
+
+        if (!request.head.keep_alive) return;
+    }
+}
+
+fn handlePostBootRequest(
+    request: *http.Server.Request,
+    allocator: std.mem.Allocator,
+    runtime: *main_mod.VmRuntime,
+) void {
+    const method = request.head.method;
+    const target = request.head.target;
+
+    log.info("{s} {s}", .{ @tagName(method), target });
+
+    var body_buf: [4096]u8 = undefined;
+    const body = readBody(request, &body_buf) catch {
+        respondError(request, .bad_request, "failed to read request body");
+        return;
+    };
+
+    if (method == .PATCH and std.mem.eql(u8, target, "/vm")) {
+        handleVmPatch(request, body, allocator, runtime);
+    } else if (method == .PUT and std.mem.eql(u8, target, "/snapshot/create")) {
+        handleSnapshotCreate(request, body, allocator, runtime);
+    } else if (method == .GET and std.mem.eql(u8, target, "/vm")) {
+        handleVmGet(request, runtime);
+    } else {
+        respondError(request, .not_found, "resource not found");
+    }
+}
+
+fn handleVmPatch(
+    request: *http.Server.Request,
+    body: ?[]const u8,
+    allocator: std.mem.Allocator,
+    runtime: *main_mod.VmRuntime,
+) void {
+    const data = body orelse {
+        respondError(request, .bad_request, "missing request body");
+        return;
+    };
+
+    const parsed = json.parseFromSlice(VmStateBody, allocator, data, .{
+        .ignore_unknown_fields = true,
+    }) catch {
+        respondError(request, .bad_request, "invalid JSON");
+        return;
+    };
+    defer parsed.deinit();
+
+    if (std.mem.eql(u8, parsed.value.state, "Paused")) {
+        if (runtime.paused.load(.acquire)) {
+            respondError(request, .bad_request, "VM is already paused");
+            return;
+        }
+        // Signal the run loop to pause: set the flag, then poke the vCPU
+        // so KVM_RUN returns immediately with -EINTR
+        runtime.paused.store(true, .release);
+        runtime.vcpu.kvm_run.immediate_exit = 1;
+
+        // Wait for the run loop to acknowledge the pause
+        var spins: u32 = 0;
+        while (!runtime.ack_paused.load(.acquire)) {
+            std.atomic.spinLoopHint();
+            spins += 1;
+            // If VM exited before we could pause it
+            if (runtime.exited.load(.acquire)) {
+                runtime.paused.store(false, .release);
+                respondError(request, .bad_request, "VM has exited");
+                return;
+            }
+        }
+        log.info("VM paused", .{});
+        respondOk(request);
+    } else if (std.mem.eql(u8, parsed.value.state, "Resumed")) {
+        if (!runtime.paused.load(.acquire)) {
+            respondError(request, .bad_request, "VM is not paused");
+            return;
+        }
+        runtime.paused.store(false, .release);
+        log.info("VM resumed", .{});
+        respondOk(request);
+    } else {
+        respondError(request, .bad_request, "state must be 'Paused' or 'Resumed'");
+    }
+}
+
+fn handleSnapshotCreate(
+    request: *http.Server.Request,
+    body: ?[]const u8,
+    allocator: std.mem.Allocator,
+    runtime: *main_mod.VmRuntime,
+) void {
+    if (!runtime.paused.load(.acquire)) {
+        respondError(request, .bad_request, "VM must be paused before creating a snapshot");
+        return;
+    }
+
+    // Buffers for sentinel-terminated paths — must outlive the snapshot.save() call
+    var sp_buf: [256]u8 = undefined;
+    var mp_buf: [256]u8 = undefined;
+    var vmstate_path: [*:0]const u8 = "snapshot.vmstate";
+    var mem_path: [*:0]const u8 = "snapshot.mem";
+
+    if (body) |data| {
+        const parsed = json.parseFromSlice(SnapshotCreateBody, allocator, data, .{
+            .ignore_unknown_fields = true,
+        }) catch {
+            respondError(request, .bad_request, "invalid JSON");
+            return;
+        };
+        defer parsed.deinit();
+
+        if (parsed.value.snapshot_path.len < sp_buf.len) {
+            @memcpy(sp_buf[0..parsed.value.snapshot_path.len], parsed.value.snapshot_path);
+            sp_buf[parsed.value.snapshot_path.len] = 0;
+            vmstate_path = @ptrCast(sp_buf[0..parsed.value.snapshot_path.len :0]);
+        }
+        if (parsed.value.mem_file_path.len < mp_buf.len) {
+            @memcpy(mp_buf[0..parsed.value.mem_file_path.len], parsed.value.mem_file_path);
+            mp_buf[parsed.value.mem_file_path.len] = 0;
+            mem_path = @ptrCast(mp_buf[0..parsed.value.mem_file_path.len :0]);
+        }
+    }
+
+    // vCPU is paused (not in KVM_RUN), safe to read all state
+    snapshot.save(
+        vmstate_path,
+        mem_path,
+        runtime.vcpu,
+        runtime.vm,
+        runtime.mem,
+        runtime.serial,
+        runtime.devices,
+        runtime.device_count,
+    ) catch |err| {
+        log.err("snapshot save failed: {}", .{err});
+        respondError(request, .internal_server_error, "snapshot save failed");
+        return;
+    };
+
+    respondOk(request);
+}
+
+fn handleVmGet(request: *http.Server.Request, runtime: *main_mod.VmRuntime) void {
+    const state: []const u8 = if (runtime.exited.load(.acquire))
+        "Exited"
+    else if (runtime.paused.load(.acquire))
+        "Paused"
+    else
+        "Running";
+
+    var buf: [64]u8 = undefined;
+    const resp = std.fmt.bufPrint(&buf, "{{\"state\":\"{s}\"}}", .{state}) catch {
+        respondError(request, .internal_server_error, "format failed");
+        return;
+    };
+
+    request.respond(resp, .{
+        .status = .ok,
         .extra_headers = &.{
             .{ .name = "content-type", .value = "application/json" },
         },

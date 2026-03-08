@@ -131,8 +131,12 @@ Create save() and load() orchestrator. Depends on steps 1-3.
 ### Step 5+6: CLI paths (main.zig) ✅
 Added `--restore` boot path (skips kernel load, calls snapshot.load()), `--save-on-halt` (saves snapshot when guest halts), `--vmstate-path`/`--mem-path` for file paths. VmRuntime/pause deferred to Step 7 (only needed for live API-triggered snapshots).
 
-### Step 7: API endpoints (api.zig)
-Add PATCH /vm, PUT /snapshot/create, PUT /snapshot/load. Run API server post-boot in thread. Needs VmRuntime struct + pause mechanism.
+### Step 7: API endpoints (api.zig, main.zig) ✅
+Added post-boot API server with VmRuntime struct + atomic pause mechanism.
+- PATCH /vm {"state":"Paused"/"Resumed"} — pause/resume vCPU via immediate_exit + atomic flag
+- PUT /snapshot/create {"snapshot_path":"...", "mem_file_path":"..."} — save VM state (must be paused)
+- GET /vm — query VM status (Running/Paused/Exited)
+- Run loop executes in spawned thread, API server in main thread (reuses std.Io from init).
 
 ### Step 8: Tests (tests.zig) ✅
 Serial snapshot round-trip, queue snapshot round-trip, header validation.
