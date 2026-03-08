@@ -25,6 +25,41 @@ pub fn init(mem_size: usize) !Self {
     return .{ .mem = mem };
 }
 
+/// Restore guest memory by mmap'ing a snapshot file with MAP_PRIVATE.
+/// Pages are demand-loaded from the file via kernel page faults (copy-on-write).
+/// This is the key to ~5ms restore: no upfront memory read regardless of VM size.
+/// The file can be closed after mmap — the kernel holds a reference.
+pub fn initFromFile(path: [*:0]const u8, expected_size: usize) !Self {
+    const linux = std.os.linux;
+
+    const open_rc: isize = @bitCast(linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0));
+    if (open_rc < 0) return error.SnapshotOpenFailed;
+    const fd: i32 = @intCast(open_rc);
+    defer _ = linux.close(fd);
+
+    // Validate file size matches expected guest memory size
+    var stx: linux.Statx = undefined;
+    const stat_rc: isize = @bitCast(linux.statx(fd, "", @as(u32, linux.AT.EMPTY_PATH), .{}, &stx));
+    if (stat_rc < 0) return error.SnapshotStatFailed;
+    if (@as(u64, @intCast(stx.size)) != expected_size) {
+        log.err("memory file size mismatch: got {} expected {}", .{ stx.size, expected_size });
+        return error.SnapshotSizeMismatch;
+    }
+
+    // MAP_PRIVATE: writes go to anonymous COW pages, reads demand-page from file
+    const mem = std.posix.mmap(
+        null,
+        expected_size,
+        .{ .READ = true, .WRITE = true },
+        .{ .TYPE = .PRIVATE },
+        fd,
+        0,
+    ) catch return error.SnapshotMmapFailed;
+
+    log.info("guest memory restored: {} MB from file (demand-paged)", .{expected_size / (1024 * 1024)});
+    return .{ .mem = mem };
+}
+
 pub fn deinit(self: Self) void {
     std.posix.munmap(self.mem);
 }

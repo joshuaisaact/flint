@@ -5,6 +5,9 @@ const std = @import("std");
 const Memory = @import("memory.zig");
 const boot_params = @import("boot/params.zig");
 const Serial = @import("devices/serial.zig");
+const Queue = @import("devices/virtio/queue.zig");
+const snapshot = @import("snapshot.zig");
+
 
 // -- Memory tests --
 
@@ -191,4 +194,77 @@ test "serial: scratch register is read-write" {
     var read_data = [1]u8{0};
     serial.handleIoRead(Serial.COM1_PORT + 7, &read_data);
     try std.testing.expectEqual(@as(u8, 0xAB), read_data[0]);
+}
+
+// -- Snapshot tests --
+
+test "snapshot: serial round-trip preserves register state" {
+    var serial = Serial.init(-1);
+
+    // Configure some non-default state
+    serial.handleIoWrite(Serial.COM1_PORT + 1, &[1]u8{0x03}); // IER: RDA + THRE
+    serial.handleIoWrite(Serial.COM1_PORT + 7, &[1]u8{0xBE}); // SCR
+    serial.handleIoWrite(Serial.COM1_PORT + 3, &[1]u8{0x80}); // LCR: set DLAB
+    serial.handleIoWrite(Serial.COM1_PORT + 0, &[1]u8{0x0C}); // DLL: divisor low
+    serial.handleIoWrite(Serial.COM1_PORT + 1, &[1]u8{0x00}); // DLH: divisor high
+    serial.handleIoWrite(Serial.COM1_PORT + 3, &[1]u8{0x03}); // LCR: 8N1, clear DLAB
+
+    const saved = serial.snapshotSave();
+
+    // Create a fresh serial and restore into it
+    var restored = Serial.init(-1);
+    restored.snapshotRestore(saved);
+
+    try std.testing.expectEqual(serial.ier, restored.ier);
+    try std.testing.expectEqual(serial.lcr, restored.lcr);
+    try std.testing.expectEqual(serial.scr, restored.scr);
+    try std.testing.expectEqual(serial.dll, restored.dll);
+    try std.testing.expectEqual(serial.dlh, restored.dlh);
+    try std.testing.expectEqual(serial.irq_pending, restored.irq_pending);
+}
+
+test "snapshot: queue round-trip preserves host tracking state" {
+    var q = Queue{};
+    q.size = 128;
+    q.ready = true;
+    q.desc_addr = 0x1000;
+    q.avail_addr = 0x2000;
+    q.used_addr = 0x3000;
+    q.last_avail_idx = 42;
+    q.next_used_idx = 37;
+
+    const saved = q.snapshotSave();
+
+    var restored = Queue{};
+    restored.snapshotRestore(saved);
+
+    try std.testing.expectEqual(q.size, restored.size);
+    try std.testing.expectEqual(q.ready, restored.ready);
+    try std.testing.expectEqual(q.desc_addr, restored.desc_addr);
+    try std.testing.expectEqual(q.avail_addr, restored.avail_addr);
+    try std.testing.expectEqual(q.used_addr, restored.used_addr);
+    try std.testing.expectEqual(q.last_avail_idx, restored.last_avail_idx);
+    try std.testing.expectEqual(q.next_used_idx, restored.next_used_idx);
+}
+
+test "snapshot: header magic validation" {
+    // Valid header
+    var buf: [snapshot.HEADER_SIZE]u8 = undefined;
+    snapshot.writeHeader(&buf, 512 * 1024 * 1024, 2);
+    const header = try snapshot.readHeader(buf);
+    try std.testing.expectEqual(@as(u64, 512 * 1024 * 1024), header.mem_size);
+    try std.testing.expectEqual(@as(u32, 2), header.device_count);
+
+    // Corrupt magic
+    buf[0] = 'X';
+    try std.testing.expectError(error.InvalidSnapshot, snapshot.readHeader(buf));
+}
+
+test "snapshot: header version validation" {
+    var buf: [snapshot.HEADER_SIZE]u8 = undefined;
+    snapshot.writeHeader(&buf, 256 * 1024 * 1024, 0);
+
+    // Corrupt version to 99
+    std.mem.writeInt(u32, buf[16..20], 99, .little);
+    try std.testing.expectError(error.InvalidSnapshot, snapshot.readHeader(buf));
 }

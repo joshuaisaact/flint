@@ -77,8 +77,117 @@ pub fn deinit(self: *Self) void {
     switch (self.backend) {
         .blk => |b| b.deinit(),
         .net => |n| n.deinit(),
-        .vsock => self.backend.vsock.deinit(),
+        .vsock => |*v| v.deinit(),
     }
+}
+
+// --- Snapshot support ---
+// Transport state is saved/restored as a fixed-size header (25 bytes) plus
+// per-queue state. Backend-specific data (disk path, TAP name, etc.) is
+// saved so the device can be reopened on restore — but live connections
+// (vsock sockets, TAP fd state) are NOT preserved.
+
+// Identity (16) + transport (29) + queues (31*3=93) = 138 bytes before backend data
+const IDENTITY_SIZE = 16; // device_id:u32 + mmio_base:u64 + irq:u32
+const TRANSPORT_STATE_SIZE = 29; // status:u8 + features_sel:u32 + driver_features_sel:u32 + driver_features:u64 + queue_sel:u32 + interrupt_status:u32 + config_generation:u32
+
+/// Write full device snapshot to buffer. Returns bytes written.
+pub fn snapshotSave(self: *const Self, buf: []u8) usize {
+    var pos: usize = 0;
+
+    // Device identity
+    std.mem.writeInt(u32, buf[pos..][0..4], self.device_id, .little);
+    pos += 4;
+    std.mem.writeInt(u64, buf[pos..][0..8], self.mmio_base, .little);
+    pos += 8;
+    std.mem.writeInt(u32, buf[pos..][0..4], self.irq, .little);
+    pos += 4;
+
+    // Transport state
+    buf[pos] = self.status;
+    pos += 1;
+    std.mem.writeInt(u32, buf[pos..][0..4], self.device_features_sel, .little);
+    pos += 4;
+    std.mem.writeInt(u32, buf[pos..][0..4], self.driver_features_sel, .little);
+    pos += 4;
+    std.mem.writeInt(u64, buf[pos..][0..8], self.driver_features, .little);
+    pos += 8;
+    std.mem.writeInt(u32, buf[pos..][0..4], self.queue_sel, .little);
+    pos += 4;
+    std.mem.writeInt(u32, buf[pos..][0..4], self.interrupt_status, .little);
+    pos += 4;
+    std.mem.writeInt(u32, buf[pos..][0..4], self.config_generation, .little);
+    pos += 4;
+
+    // Queue state (all 3 slots, even if unused — simpler and only 93 bytes)
+    for (&self.queues) |*q| {
+        const qdata = q.snapshotSave();
+        @memcpy(buf[pos..][0..Queue.SNAPSHOT_SIZE], &qdata);
+        pos += Queue.SNAPSHOT_SIZE;
+    }
+
+    std.debug.assert(pos == IDENTITY_SIZE + TRANSPORT_STATE_SIZE + Queue.SNAPSHOT_SIZE * 3);
+
+    // Backend-specific config
+    switch (self.backend) {
+        .blk => |b| {
+            std.mem.writeInt(u64, buf[pos..][0..8], b.capacity, .little);
+            pos += 8;
+        },
+        .net => |n| {
+            @memcpy(buf[pos..][0..6], &n.mac);
+            pos += 6;
+        },
+        .vsock => |v| {
+            std.mem.writeInt(u64, buf[pos..][0..8], v.guest_cid, .little);
+            pos += 8;
+        },
+    }
+
+    return pos;
+}
+
+/// Restore transport and queue state from buffer. Backend must already be
+/// initialized (disk reopened, TAP recreated, etc.) before calling this.
+/// Returns bytes consumed.
+pub fn snapshotRestore(self: *Self, buf: []const u8) usize {
+    var pos: usize = 0;
+
+    // Skip device identity (4+8+4 = 16 bytes) — already set by init*()
+    pos += 16;
+
+    // Transport state
+    self.status = buf[pos];
+    pos += 1;
+    self.device_features_sel = std.mem.readInt(u32, buf[pos..][0..4], .little);
+    pos += 4;
+    self.driver_features_sel = std.mem.readInt(u32, buf[pos..][0..4], .little);
+    pos += 4;
+    self.driver_features = std.mem.readInt(u64, buf[pos..][0..8], .little);
+    pos += 8;
+    self.queue_sel = std.mem.readInt(u32, buf[pos..][0..4], .little);
+    pos += 4;
+    self.interrupt_status = std.mem.readInt(u32, buf[pos..][0..4], .little);
+    pos += 4;
+    self.config_generation = std.mem.readInt(u32, buf[pos..][0..4], .little);
+    pos += 4;
+
+    // Queue state
+    for (&self.queues) |*q| {
+        q.snapshotRestore(buf[pos..][0..Queue.SNAPSHOT_SIZE].*);
+        pos += Queue.SNAPSHOT_SIZE;
+    }
+
+    std.debug.assert(pos == IDENTITY_SIZE + TRANSPORT_STATE_SIZE + Queue.SNAPSHOT_SIZE * 3);
+
+    // Skip backend-specific data (already used during init)
+    switch (self.backend) {
+        .blk => pos += 8,
+        .net => pos += 6,
+        .vsock => pos += 8,
+    }
+
+    return pos;
 }
 
 fn numQueues(self: Self) u32 {
@@ -279,13 +388,13 @@ pub fn processQueues(self: *Self, mem: *Memory) bool {
                 if (n.processTx(mem, &self.queues[Net.TX_QUEUE])) did_work = true;
             }
         },
-        .vsock => {
+        .vsock => |*v| {
             // Process TX queue (queue 1) and deliver pending control packets
             if (self.queues[Vsock.TX_QUEUE].isReady()) {
-                if (self.backend.vsock.processTx(mem, &self.queues[Vsock.TX_QUEUE])) did_work = true;
+                if (v.processTx(mem, &self.queues[Vsock.TX_QUEUE])) did_work = true;
             }
             if (self.queues[Vsock.RX_QUEUE].isReady()) {
-                if (self.backend.vsock.deliverPending(mem, &self.queues[Vsock.RX_QUEUE])) did_work = true;
+                if (v.deliverPending(mem, &self.queues[Vsock.RX_QUEUE])) did_work = true;
             }
         },
     }
@@ -308,9 +417,9 @@ pub fn pollRx(self: *Self, mem: *Memory) bool {
                 return true;
             }
         },
-        .vsock => {
+        .vsock => |*v| {
             if (!self.queues[Vsock.RX_QUEUE].isReady()) return false;
-            if (self.backend.vsock.pollRx(mem, &self.queues[Vsock.RX_QUEUE])) {
+            if (v.pollRx(mem, &self.queues[Vsock.RX_QUEUE])) {
                 self.interrupt_status |= virtio.INT_USED_RING;
                 return true;
             }

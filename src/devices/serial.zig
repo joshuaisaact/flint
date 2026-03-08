@@ -70,6 +70,29 @@ pub fn hasPendingIrq(self: *Self) bool {
     return false;
 }
 
+// --- Snapshot support ---
+// The serial device has no external fd state to reopen — the output_fd is
+// always stdout (fd 1) and is passed fresh on restore. We only persist
+// the register file that the guest driver has configured.
+pub const SNAPSHOT_SIZE = 10;
+
+pub fn snapshotSave(self: *const Self) [SNAPSHOT_SIZE]u8 {
+    return .{ self.ier, self.iir, self.lcr, self.mcr, self.lsr, self.msr, self.scr, self.dll, self.dlh, @intFromBool(self.irq_pending) };
+}
+
+pub fn snapshotRestore(self: *Self, data: [SNAPSHOT_SIZE]u8) void {
+    self.ier = data[0];
+    self.iir = data[1];
+    self.lcr = data[2];
+    self.mcr = data[3];
+    self.lsr = data[4];
+    self.msr = data[5];
+    self.scr = data[6];
+    self.dll = data[7];
+    self.dlh = data[8];
+    self.irq_pending = data[9] != 0;
+}
+
 pub fn handleIo(self: *Self, port: u16, data: []u8, is_write: bool) void {
     const offset = port - COM1_PORT;
 

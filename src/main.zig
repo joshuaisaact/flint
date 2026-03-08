@@ -11,8 +11,14 @@ const abi = @import("kvm/abi.zig");
 const c = abi.c;
 const boot_params = @import("boot/params.zig");
 const api = @import("api.zig");
+const snapshot = @import("snapshot.zig");
 
 const log = std.log.scoped(.flint);
+
+const SnapshotOpts = struct {
+    vmstate_path: ?[*:0]const u8 = null,
+    mem_path: ?[*:0]const u8 = null,
+};
 
 const DEFAULT_MEM_SIZE = 512 * 1024 * 1024; // 512 MB
 const DEFAULT_CMDLINE = "earlyprintk=serial,ttyS0,115200 console=ttyS0 nokaslr reboot=k panic=1 pci=off nomodules";
@@ -29,6 +35,10 @@ pub fn main(init: std.process.Init) !void {
     var tap_name: ?[*:0]const u8 = null;
     var vsock_cid: ?[*:0]const u8 = null;
     var vsock_uds: ?[*:0]const u8 = null;
+    var restore_mode = false;
+    var save_on_halt = false;
+    var vmstate_path: [*:0]const u8 = "snapshot.vmstate";
+    var mem_snap_path: [*:0]const u8 = "snapshot.mem";
     var cmdline: [*:0]const u8 = DEFAULT_CMDLINE;
     var got_initrd = false;
 
@@ -60,6 +70,20 @@ pub fn main(init: std.process.Init) !void {
                 std.debug.print("--vsock-uds requires an argument\n", .{});
                 std.process.exit(1);
             };
+        } else if (std.mem.eql(u8, s, "--restore")) {
+            restore_mode = true;
+        } else if (std.mem.eql(u8, s, "--save-on-halt")) {
+            save_on_halt = true;
+        } else if (std.mem.eql(u8, s, "--vmstate-path")) {
+            vmstate_path = args.next() orelse {
+                std.debug.print("--vmstate-path requires an argument\n", .{});
+                std.process.exit(1);
+            };
+        } else if (std.mem.eql(u8, s, "--mem-path")) {
+            mem_snap_path = args.next() orelse {
+                std.debug.print("--mem-path requires an argument\n", .{});
+                std.process.exit(1);
+            };
         } else if (std.mem.indexOfScalar(u8, s, '=') != null) {
             cmdline = arg;
         } else if (kernel_path == null) {
@@ -70,7 +94,10 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    if (api_sock) |sock| {
+    if (restore_mode) {
+        // Restore mode: rebuild VM from snapshot files, no kernel load
+        try restoreVm(vmstate_path, mem_snap_path, disk_path, tap_name, vsock_cid, vsock_uds);
+    } else if (api_sock) |sock| {
         // API mode: listen for configuration, then boot
         const sock_len = std.mem.indexOfSentinel(u8, 0, sock);
         const config = try api.serve(sock[0..sock_len], init.io, init.gpa);
@@ -81,14 +108,18 @@ pub fn main(init: std.process.Init) !void {
         const tn: ?[*:0]const u8 = if (config.tap_name) |p| p.ptr else null;
         const vc: ?[*:0]const u8 = if (config.vsock_cid) |p| p.ptr else null;
         const vu: ?[*:0]const u8 = if (config.vsock_uds) |p| p.ptr else null;
-        try bootVm(kp, ip, ba, dp, tn, vc, vu, config.mem_size_mib);
+        try bootVm(kp, ip, ba, dp, tn, vc, vu, config.mem_size_mib, .{});
     } else if (kernel_path) |kp| {
         // CLI mode: boot directly from args
-        try bootVm(kp, initrd_path, cmdline, disk_path, tap_name, vsock_cid, vsock_uds, DEFAULT_MEM_SIZE / (1024 * 1024));
+        const snap_opts: SnapshotOpts = if (save_on_halt) .{
+            .vmstate_path = vmstate_path,
+            .mem_path = mem_snap_path,
+        } else .{};
+        try bootVm(kp, initrd_path, cmdline, disk_path, tap_name, vsock_cid, vsock_uds, DEFAULT_MEM_SIZE / (1024 * 1024), snap_opts);
     } else {
         std.debug.print("usage: flint <kernel> [initrd] [--disk <path>] [--tap <name>] [cmdline]\n", .{});
+        std.debug.print("       flint --restore [--vmstate-path <path>] [--mem-path <path>]\n", .{});
         std.debug.print("       flint --api-sock <path>\n", .{});
-        std.debug.print("       flint --vsock-cid <cid> --vsock-uds <path>\n", .{});
         std.process.exit(1);
     }
 }
@@ -102,6 +133,7 @@ fn bootVm(
     vsock_cid_str: ?[*:0]const u8,
     vsock_uds_path: ?[*:0]const u8,
     mem_size_mib: u32,
+    snap_opts: SnapshotOpts,
 ) !void {
     const mem_size: usize = @as(usize, mem_size_mib) * 1024 * 1024;
     const cmdline: [*:0]const u8 = cmdline_or_args orelse DEFAULT_CMDLINE;
@@ -138,37 +170,7 @@ fn bootVm(
 
     // 6. Set up virtio devices
     var devices: [virtio.MAX_DEVICES]?VirtioMmio = .{null} ** virtio.MAX_DEVICES;
-    var device_count: u32 = 0;
-
-    if (disk_path) |dp| {
-        const base = virtio.MMIO_BASE + @as(u64, device_count) * virtio.MMIO_SIZE;
-        const irq = virtio.IRQ_BASE + device_count;
-        devices[device_count] = try VirtioMmio.initBlk(base, irq, dp);
-        device_count += 1;
-    }
-
-    if (tap_name) |tn| {
-        const base = virtio.MMIO_BASE + @as(u64, device_count) * virtio.MMIO_SIZE;
-        const irq = virtio.IRQ_BASE + device_count;
-        devices[device_count] = try VirtioMmio.initNet(base, irq, tn);
-        device_count += 1;
-    }
-
-    if (vsock_cid_str) |cid_str| {
-        const uds = vsock_uds_path orelse {
-            log.err("--vsock-cid requires --vsock-uds", .{});
-            return error.MissingVsockUds;
-        };
-        const cid_len = std.mem.indexOfSentinel(u8, 0, cid_str);
-        const cid = std.fmt.parseUnsigned(u64, cid_str[0..cid_len], 10) catch {
-            log.err("invalid vsock CID: {s}", .{cid_str[0..cid_len]});
-            return error.InvalidCid;
-        };
-        const base = virtio.MMIO_BASE + @as(u64, device_count) * virtio.MMIO_SIZE;
-        const irq = virtio.IRQ_BASE + device_count;
-        devices[device_count] = try VirtioMmio.initVsock(base, irq, cid, uds);
-        device_count += 1;
-    }
+    const device_count = try initDevices(&devices, disk_path, tap_name, vsock_cid_str, vsock_uds_path);
 
     defer for (&devices) |*d| {
         if (d.*) |*dev| dev.deinit();
@@ -224,7 +226,73 @@ fn bootVm(
 
     // 10. Run
     log.info("entering VM run loop", .{});
-    try runLoop(&vcpu, &serial, &vm, &mem, &devices, device_count);
+    try runLoop(&vcpu, &serial, &vm, &mem, &devices, device_count, snap_opts);
+}
+
+/// Restore a VM from snapshot files instead of booting a kernel.
+/// The KVM VM and in-kernel devices (irqchip, PIT) must be created fresh —
+/// snapshot.load() then overwrites their state from the saved data.
+/// Device backends (disk, TAP, vsock) must be re-opened from CLI args
+/// because file descriptors don't survive across processes.
+fn restoreVm(
+    vmstate_path: [*:0]const u8,
+    mem_snap_path: [*:0]const u8,
+    disk_path: ?[*:0]const u8,
+    tap_name: ?[*:0]const u8,
+    vsock_cid_str: ?[*:0]const u8,
+    vsock_uds_path: ?[*:0]const u8,
+) !void {
+    log.info("flint restoring from snapshot", .{});
+
+    // 1. Open KVM, create VM with in-kernel devices
+    const kvm = try Kvm.open();
+    defer kvm.deinit();
+
+    const vm = try kvm.createVm();
+    defer vm.deinit();
+
+    try vm.setTssAddr(0xFFFBD000);
+    try vm.setIdentityMapAddr(0xFFFBC000);
+
+    // irqchip and PIT must exist before snapshot.load() overwrites their state
+    try vm.createIrqChip();
+    try vm.createPit2();
+
+    // 2. Re-create device backends from CLI args.
+    // The snapshot tells us what device types/slots existed, but backends
+    // hold OS resources (fds) that must be opened fresh.
+    var devices: [virtio.MAX_DEVICES]?VirtioMmio = .{null} ** virtio.MAX_DEVICES;
+    var device_count = try initDevices(&devices, disk_path, tap_name, vsock_cid_str, vsock_uds_path);
+
+    defer for (&devices) |*d| {
+        if (d.*) |*dev| dev.deinit();
+    };
+
+    // 3. Create vCPU (must exist before snapshot.load() sets its registers)
+    const vcpu_mmap_size = try kvm.getVcpuMmapSize();
+    var vcpu = try vm.createVcpu(0, vcpu_mmap_size);
+    defer vcpu.deinit();
+
+    // 4. Load snapshot — restores vCPU registers, VM state, device transport
+    // state, serial registers, and mmaps guest memory from file
+    var serial = Serial.init(1);
+    var mem = try snapshot.load(
+        vmstate_path,
+        mem_snap_path,
+        &vcpu,
+        &vm,
+        &serial,
+        &devices,
+        &device_count,
+    );
+    defer mem.deinit();
+
+    // 5. Wire up memory region so KVM can access restored guest RAM
+    try vm.setMemoryRegion(0, 0, mem.alignedMem());
+
+    // 6. Enter run loop — guest resumes execution from where it was paused
+    log.info("entering VM run loop (restored)", .{});
+    try runLoop(&vcpu, &serial, &vm, &mem, &devices, device_count, .{});
 }
 
 // Memory layout for boot structures (all below boot_params at 0x7000)
@@ -334,7 +402,49 @@ fn injectIrq(vm: *const Vm, irq: u32) void {
 
 const DeviceArray = [virtio.MAX_DEVICES]?VirtioMmio;
 
-fn runLoop(vcpu: *Vcpu, serial: *Serial, vm: *const Vm, mem: *Memory, devices: *DeviceArray, device_count: u32) !void {
+fn initDevices(
+    devices: *DeviceArray,
+    disk_path: ?[*:0]const u8,
+    tap_name: ?[*:0]const u8,
+    vsock_cid_str: ?[*:0]const u8,
+    vsock_uds_path: ?[*:0]const u8,
+) !u32 {
+    var device_count: u32 = 0;
+
+    if (disk_path) |dp| {
+        const base = virtio.MMIO_BASE + @as(u64, device_count) * virtio.MMIO_SIZE;
+        const irq = virtio.IRQ_BASE + device_count;
+        devices[device_count] = try VirtioMmio.initBlk(base, irq, dp);
+        device_count += 1;
+    }
+
+    if (tap_name) |tn| {
+        const base = virtio.MMIO_BASE + @as(u64, device_count) * virtio.MMIO_SIZE;
+        const irq = virtio.IRQ_BASE + device_count;
+        devices[device_count] = try VirtioMmio.initNet(base, irq, tn);
+        device_count += 1;
+    }
+
+    if (vsock_cid_str) |cid_str| {
+        const uds = vsock_uds_path orelse {
+            log.err("--vsock-cid requires --vsock-uds", .{});
+            return error.MissingVsockUds;
+        };
+        const cid_len = std.mem.indexOfSentinel(u8, 0, cid_str);
+        const cid = std.fmt.parseUnsigned(u64, cid_str[0..cid_len], 10) catch {
+            log.err("invalid vsock CID: {s}", .{cid_str[0..cid_len]});
+            return error.InvalidCid;
+        };
+        const base = virtio.MMIO_BASE + @as(u64, device_count) * virtio.MMIO_SIZE;
+        const irq = virtio.IRQ_BASE + device_count;
+        devices[device_count] = try VirtioMmio.initVsock(base, irq, cid, uds);
+        device_count += 1;
+    }
+
+    return device_count;
+}
+
+fn runLoop(vcpu: *Vcpu, serial: *Serial, vm: *const Vm, mem: *Memory, devices: *DeviceArray, device_count: u32, snap_opts: SnapshotOpts) !void {
     var exit_count: u64 = 0;
     while (true) {
         const exit_reason = vcpu.run() catch |err| {
@@ -397,6 +507,12 @@ fn runLoop(vcpu: *Vcpu, serial: *Serial, vm: *const Vm, mem: *Memory, devices: *
             },
             c.KVM_EXIT_HLT => {
                 log.info("guest halted after {} exits", .{exit_count});
+                if (snap_opts.vmstate_path) |sp| {
+                    // vCPU is stopped (just exited KVM_RUN), safe to snapshot
+                    snapshot.save(sp, snap_opts.mem_path.?, vcpu, vm, mem, serial, devices, device_count) catch |err| {
+                        log.err("snapshot save failed: {}", .{err});
+                    };
+                }
                 return;
             },
             c.KVM_EXIT_SHUTDOWN => {

@@ -91,6 +91,42 @@ pub fn pushUsed(self: *Self, mem: *Memory, desc_head: u16, len: u32) !void {
     std.mem.writeInt(u16, idx_bytes[0..2], self.next_used_idx, .little);
 }
 
+// --- Snapshot support ---
+// Queue state is entirely in these struct fields — the actual descriptor/ring
+// data lives in guest memory and is saved/restored with the memory file.
+// We only need to persist our host-side tracking indices.
+pub const SNAPSHOT_SIZE = 31; // 2+1+8+8+8+2+2
+
+pub fn snapshotSave(self: *const Self) [SNAPSHOT_SIZE]u8 {
+    var buf: [SNAPSHOT_SIZE]u8 = undefined;
+    std.mem.writeInt(u16, buf[0..2], self.size, .little);
+    buf[2] = @intFromBool(self.ready);
+    std.mem.writeInt(u64, buf[3..11], self.desc_addr, .little);
+    std.mem.writeInt(u64, buf[11..19], self.avail_addr, .little);
+    std.mem.writeInt(u64, buf[19..27], self.used_addr, .little);
+    std.mem.writeInt(u16, buf[27..29], self.last_avail_idx, .little);
+    std.mem.writeInt(u16, buf[29..31], self.next_used_idx, .little);
+    return buf;
+}
+
+pub fn snapshotRestore(self: *Self, buf: [SNAPSHOT_SIZE]u8) void {
+    const size = std.mem.readInt(u16, buf[0..2], .little);
+    // Validate queue size: must be 0, or a power-of-2 <= MAX_QUEUE_SIZE.
+    // Invalid sizes would cause division-by-zero in ring index modular arithmetic.
+    if (size != 0 and (size > MAX_QUEUE_SIZE or @popCount(size) != 1)) {
+        log.warn("snapshot: invalid queue size {}, resetting to 0", .{size});
+        self.reset();
+        return;
+    }
+    self.size = size;
+    self.ready = buf[2] != 0;
+    self.desc_addr = std.mem.readInt(u64, buf[3..11], .little);
+    self.avail_addr = std.mem.readInt(u64, buf[11..19], .little);
+    self.used_addr = std.mem.readInt(u64, buf[19..27], .little);
+    self.last_avail_idx = std.mem.readInt(u16, buf[27..29], .little);
+    self.next_used_idx = std.mem.readInt(u16, buf[29..31], .little);
+}
+
 /// Walk a descriptor chain starting at `head`, collecting up to `max` descriptors.
 /// Returns the number of descriptors collected. Detects cycles via a visited bitset.
 pub fn collectChain(self: Self, mem: *Memory, head: u16, descs: []Desc) !usize {
