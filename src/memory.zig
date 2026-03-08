@@ -42,6 +42,7 @@ pub fn slice(self: Self, guest_addr: usize, len: usize) ![]u8 {
 /// Get a pointer to a struct at the given guest physical address.
 pub fn ptrAt(self: Self, comptime T: type, guest_addr: usize) !*T {
     if (guest_addr + @sizeOf(T) > self.mem.len) return error.GuestMemoryOutOfBounds;
+    if (guest_addr % @alignOf(T) != 0) return error.GuestMemoryMisaligned;
     return @ptrCast(@alignCast(&self.mem[guest_addr]));
 }
 

@@ -17,8 +17,9 @@ pub const LoadResult = struct {
 
 /// Read an entire file into memory using linux syscalls.
 fn readFile(path: [*:0]const u8) ![]u8 {
-    const fd: i32 = @bitCast(@as(u32, @truncate(linux.open(path, .{ .ACCMODE = .RDONLY }, 0))));
-    if (fd < 0) return error.OpenFailed;
+    const open_rc: isize = @bitCast(linux.open(path, .{ .ACCMODE = .RDONLY }, 0));
+    if (open_rc < 0) return error.OpenFailed;
+    const fd: i32 = @intCast(open_rc);
     defer _ = linux.close(fd);
 
     // Get file size via statx
@@ -33,13 +34,19 @@ fn readFile(path: [*:0]const u8) ![]u8 {
 
     var total: usize = 0;
     while (total < file_size) {
-        const rc = linux.read(fd, buf.ptr + total, file_size - total);
-        const signed: isize = @bitCast(rc);
-        if (signed <= 0) break;
-        total += rc;
+        const rc: isize = @bitCast(linux.read(fd, buf.ptr + total, file_size - total));
+        if (rc > 0) {
+            total += @intCast(rc);
+        } else if (rc == 0) {
+            return error.UnexpectedEof;
+        } else {
+            const errno: linux.E = @enumFromInt(@as(u16, @intCast(-rc)));
+            if (errno == .INTR) continue;
+            return error.ReadFailed;
+        }
     }
 
-    return buf[0..total];
+    return buf;
 }
 
 /// Load a bzImage from disk into guest memory.

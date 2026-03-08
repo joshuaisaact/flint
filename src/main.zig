@@ -186,12 +186,14 @@ fn runLoop(vcpu: *Vcpu, serial: *Serial) !void {
                 return;
             },
             c.KVM_EXIT_SHUTDOWN => {
-                const regs = vcpu.getRegs() catch unreachable;
-                const sregs = vcpu.getSregs() catch unreachable;
                 log.info("guest shutdown (triple fault) after {} exits", .{exit_count});
-                log.info("  rip=0x{x} rsp=0x{x} rflags=0x{x}", .{ regs.rip, regs.rsp, regs.rflags });
-                log.info("  cr0=0x{x} cr3=0x{x} cr4=0x{x} efer=0x{x}", .{ sregs.cr0, sregs.cr3, sregs.cr4, sregs.efer });
-                log.info("  cs: sel=0x{x} base=0x{x} type={} l={} db={}", .{ sregs.cs.selector, sregs.cs.base, sregs.cs.type, sregs.cs.l, sregs.cs.db });
+                if (vcpu.getRegs()) |regs| {
+                    log.info("  rip=0x{x} rsp=0x{x} rflags=0x{x}", .{ regs.rip, regs.rsp, regs.rflags });
+                } else |_| {}
+                if (vcpu.getSregs()) |sregs| {
+                    log.info("  cr0=0x{x} cr3=0x{x} cr4=0x{x} efer=0x{x}", .{ sregs.cr0, sregs.cr3, sregs.cr4, sregs.efer });
+                    log.info("  cs: sel=0x{x} base=0x{x} type={} l={} db={}", .{ sregs.cs.selector, sregs.cs.base, sregs.cs.type, sregs.cs.l, sregs.cs.db });
+                } else |_| {}
                 return;
             },
             c.KVM_EXIT_FAIL_ENTRY => {
@@ -201,9 +203,10 @@ fn runLoop(vcpu: *Vcpu, serial: *Serial) !void {
             },
             c.KVM_EXIT_INTERNAL_ERROR => {
                 const internal = vcpu.kvm_run.unnamed_0.internal;
-                const regs = vcpu.getRegs() catch unreachable;
                 log.err("KVM internal error: suberror={} (1=emulation failure) after {} exits", .{ internal.suberror, exit_count });
-                log.err("  rip=0x{x} rsp=0x{x}", .{ regs.rip, regs.rsp });
+                if (vcpu.getRegs()) |regs| {
+                    log.err("  rip=0x{x} rsp=0x{x}", .{ regs.rip, regs.rsp });
+                } else |_| {}
                 return error.VmInternalError;
             },
             c.KVM_EXIT_MMIO => {
