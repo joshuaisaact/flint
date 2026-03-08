@@ -80,21 +80,9 @@ fn validateSectorRange(self: Self, sector: u64, data_len: u64) bool {
 
 /// Process a single request from the virtqueue.
 pub fn processRequest(self: Self, mem: *Memory, queue: *Queue, head: u16) !void {
-    // Walk the chain collecting descriptors
+    // Walk the chain collecting descriptors (with cycle detection)
     var descs: [16]Queue.Desc = undefined;
-    var desc_count: usize = 0;
-
-    var idx = head;
-    while (true) {
-        if (desc_count >= descs.len) return error.DescChainTooLong;
-        descs[desc_count] = try queue.getDesc(mem, idx);
-        desc_count += 1;
-        if (descs[desc_count - 1].flags & virtio.DESC_F_NEXT != 0) {
-            idx = descs[desc_count - 1].next;
-        } else {
-            break;
-        }
-    }
+    const desc_count = try queue.collectChain(mem, head, &descs);
 
     // Need at least header (desc 0) + status (last desc)
     if (desc_count < 2) {
@@ -135,6 +123,7 @@ pub fn processRequest(self: Self, mem: *Memory, queue: *Queue, head: u16) !void 
                 status = S_IOERR;
             } else {
                 // Read from disk into guest buffers
+                // sector is validated by validateSectorRange — multiplication is safe
                 var file_offset: u64 = sector * SECTOR_SIZE;
                 for (descs[1 .. desc_count - 1]) |desc| {
                     const buf = try mem.slice(@intCast(desc.addr), desc.len);
@@ -148,7 +137,10 @@ pub fn processRequest(self: Self, mem: *Memory, queue: *Queue, head: u16) !void 
                     if (bytes_read < desc.len) {
                         @memset(buf[bytes_read..], 0);
                     }
-                    file_offset += desc.len;
+                    file_offset = std.math.add(u64, file_offset, desc.len) catch {
+                        status = S_IOERR;
+                        break;
+                    };
                 }
                 device_written += total_data_len;
             }
@@ -160,6 +152,7 @@ pub fn processRequest(self: Self, mem: *Memory, queue: *Queue, head: u16) !void 
                 status = S_IOERR;
             } else {
                 // Write from guest buffers to disk
+                // sector is validated by validateSectorRange — multiplication is safe
                 var file_offset: u64 = sector * SECTOR_SIZE;
                 for (descs[1 .. desc_count - 1]) |desc| {
                     const buf = try mem.slice(@intCast(desc.addr), desc.len);
@@ -168,7 +161,10 @@ pub fn processRequest(self: Self, mem: *Memory, queue: *Queue, head: u16) !void 
                         status = S_IOERR;
                         break;
                     }
-                    file_offset += desc.len;
+                    file_offset = std.math.add(u64, file_offset, desc.len) catch {
+                        status = S_IOERR;
+                        break;
+                    };
                 }
             }
         },

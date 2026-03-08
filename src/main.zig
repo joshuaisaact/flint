@@ -110,6 +110,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
     if (device_count > 0) {
         var pos: usize = 0;
         const base_cmdline = cmdline[0..std.mem.indexOfSentinel(u8, 0, cmdline)];
+        if (base_cmdline.len >= cmdline_buf.len) {
+            log.err("kernel cmdline too long: {} bytes", .{base_cmdline.len});
+            return error.CmdlineTooLong;
+        }
         @memcpy(cmdline_buf[pos..][0..base_cmdline.len], base_cmdline);
         pos += base_cmdline.len;
 
@@ -250,10 +254,12 @@ fn setupRegisters(vcpu: *Vcpu, boot: loader.LoadResult, mem: *Memory) !void {
 
 fn injectIrq(vm: *const Vm, irq: u32) void {
     vm.setIrqLine(irq, 1) catch |err| {
-        log.warn("setIrqLine high: {}", .{err});
-        return;
+        log.warn("setIrqLine high failed: {}", .{err});
+        return; // skip de-assert if assert failed
     };
-    vm.setIrqLine(irq, 0) catch |err| log.warn("setIrqLine low: {}", .{err});
+    vm.setIrqLine(irq, 0) catch |err| {
+        log.warn("setIrqLine low failed: {}", .{err});
+    };
 }
 
 const DeviceArray = [virtio.MAX_DEVICES]?VirtioMmio;

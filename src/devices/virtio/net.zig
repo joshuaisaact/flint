@@ -128,7 +128,7 @@ pub fn processTx(self: Self, mem: *Memory, queue: *Queue) bool {
 
         self.transmitChain(mem, queue, head) catch |err| {
             log.err("TX failed: {}", .{err});
-            queue.pushUsed(mem, head, 0) catch {};
+            queue.pushUsed(mem, head, 0) catch |e| log.warn("TX pushUsed failed: {}", .{e});
         };
         did_work = true;
     }
@@ -137,27 +137,19 @@ pub fn processTx(self: Self, mem: *Memory, queue: *Queue) bool {
 
 /// Transmit a single descriptor chain to the TAP device.
 fn transmitChain(self: Self, mem: *Memory, queue: *Queue, head: u16) !void {
-    // Collect all descriptor data into a contiguous buffer for writev
-    // Typical frame: virtio_net_hdr(12) + ethernet frame (up to ~1514)
-    var iov: [16]std.posix.iovec = undefined;
-    var iov_count: usize = 0;
+    // Collect all descriptors upfront (with cycle detection)
+    var descs: [16]Queue.Desc = undefined;
+    const desc_count = try queue.collectChain(mem, head, &descs);
 
-    var idx = head;
-    while (true) {
-        if (iov_count >= iov.len) break;
-        const desc = try queue.getDesc(mem, idx);
+    // Build iovec from collected descriptors for writev
+    var iov: [16]std.posix.iovec = undefined;
+    for (descs[0..desc_count], 0..) |desc, i| {
         const buf = try mem.slice(@intCast(desc.addr), desc.len);
-        iov[iov_count] = .{ .base = buf.ptr, .len = buf.len };
-        iov_count += 1;
-        if (desc.flags & virtio.DESC_F_NEXT != 0) {
-            idx = desc.next;
-        } else {
-            break;
-        }
+        iov[i] = .{ .base = buf.ptr, .len = buf.len };
     }
 
-    if (iov_count > 0) {
-        const rc: isize = @bitCast(linux.writev(self.tap_fd, @ptrCast(&iov), @intCast(iov_count)));
+    if (desc_count > 0) {
+        const rc: isize = @bitCast(linux.writev(self.tap_fd, @ptrCast(&iov), @intCast(desc_count)));
         if (rc < 0) {
             log.warn("TAP writev failed", .{});
         }
@@ -181,21 +173,21 @@ pub fn pollRx(self: Self, mem: *Memory, queue: *Queue) bool {
         const bytes_written = self.receiveFrame(mem, queue, head) catch |err| {
             // EAGAIN/EWOULDBLOCK means no more frames
             if (err == error.WouldBlock) {
-                // Put the descriptor back by not advancing (already popped, push unused)
-                queue.pushUsed(mem, head, 0) catch {};
+                // Already popped descriptor, push back as unused
+                queue.pushUsed(mem, head, 0) catch |e| log.warn("RX pushUsed failed: {}", .{e});
                 break;
             }
             log.err("RX failed: {}", .{err});
-            queue.pushUsed(mem, head, 0) catch {};
+            queue.pushUsed(mem, head, 0) catch |e| log.warn("RX pushUsed failed: {}", .{e});
             break;
         };
 
         if (bytes_written == 0) {
-            queue.pushUsed(mem, head, 0) catch {};
+            queue.pushUsed(mem, head, 0) catch |e| log.warn("RX pushUsed failed: {}", .{e});
             break;
         }
 
-        queue.pushUsed(mem, head, bytes_written) catch {};
+        queue.pushUsed(mem, head, bytes_written) catch |e| log.warn("RX pushUsed failed: {}", .{e});
         did_work = true;
     }
     return did_work;
@@ -203,32 +195,23 @@ pub fn pollRx(self: Self, mem: *Memory, queue: *Queue) bool {
 
 /// Receive a single frame from TAP into the guest RX descriptor chain.
 fn receiveFrame(self: Self, mem: *Memory, queue: *Queue, head: u16) !u32 {
-    // Build iovec from the descriptor chain for readv
-    var iov: [16]std.posix.iovec = undefined;
-    var iov_count: usize = 0;
-    var total_buf_len: u32 = 0;
+    // Collect all descriptors upfront (with cycle detection)
+    var descs: [16]Queue.Desc = undefined;
+    const desc_count = try queue.collectChain(mem, head, &descs);
 
-    var idx = head;
-    while (true) {
-        if (iov_count >= iov.len) break;
-        const desc = try queue.getDesc(mem, idx);
+    // Build iovec from collected descriptors for readv
+    var iov: [16]std.posix.iovec = undefined;
+    for (descs[0..desc_count], 0..) |desc, i| {
         const buf = try mem.slice(@intCast(desc.addr), desc.len);
-        iov[iov_count] = .{ .base = buf.ptr, .len = buf.len };
-        iov_count += 1;
-        total_buf_len += desc.len;
-        if (desc.flags & virtio.DESC_F_NEXT != 0) {
-            idx = desc.next;
-        } else {
-            break;
-        }
+        iov[i] = .{ .base = buf.ptr, .len = buf.len };
     }
 
-    if (iov_count == 0) return 0;
+    if (desc_count == 0) return 0;
 
-    const rc: isize = @bitCast(linux.readv(self.tap_fd, @ptrCast(&iov), @intCast(iov_count)));
+    const rc: isize = @bitCast(linux.readv(self.tap_fd, @ptrCast(&iov), @intCast(desc_count)));
     if (rc < 0) {
-        const errno: u16 = @intCast(-rc);
-        if (errno == 11 or errno == 35) { // EAGAIN or EWOULDBLOCK
+        const errno: linux.E = @enumFromInt(@as(u16, @intCast(-rc)));
+        if (errno == .AGAIN) {
             return error.WouldBlock;
         }
         return error.ReadFailed;

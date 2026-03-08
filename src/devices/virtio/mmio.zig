@@ -166,10 +166,12 @@ pub fn handleWrite(self: *Self, offset: u64, data: []const u8) void {
     switch (offset) {
         virtio.MMIO_DEVICE_FEATURES_SEL => self.device_features_sel = val,
         virtio.MMIO_DRIVER_FEATURES => {
+            // Filter against advertised features — guest cannot enable unsupported features
+            const supported = self.deviceFeatures();
             if (self.driver_features_sel == 0) {
-                setLow32(&self.driver_features, val);
+                setLow32(&self.driver_features, val & @as(u32, @truncate(supported)));
             } else {
-                setHigh32(&self.driver_features, val);
+                setHigh32(&self.driver_features, val & @as(u32, @truncate(supported >> 32)));
             }
         },
         virtio.MMIO_DRIVER_FEATURES_SEL => self.driver_features_sel = val,
@@ -249,7 +251,7 @@ pub fn processQueues(self: *Self, mem: *Memory) bool {
 
                 b.processRequest(mem, &self.queues[0], head) catch |err| {
                     log.err("block request failed: {}", .{err});
-                    self.queues[0].pushUsed(mem, head, 0) catch {};
+                    self.queues[0].pushUsed(mem, head, 0) catch |e| log.warn("pushUsed failed: {}", .{e});
                 };
                 did_work = true;
             }

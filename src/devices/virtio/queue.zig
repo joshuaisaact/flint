@@ -91,6 +91,34 @@ pub fn pushUsed(self: *Self, mem: *Memory, desc_head: u16, len: u32) !void {
     std.mem.writeInt(u16, idx_bytes[0..2], self.next_used_idx, .little);
 }
 
+/// Walk a descriptor chain starting at `head`, collecting up to `max` descriptors.
+/// Returns the number of descriptors collected. Detects cycles via a visited bitset.
+pub fn collectChain(self: Self, mem: *Memory, head: u16, descs: []Desc) !usize {
+    var visited: [MAX_QUEUE_SIZE / 8]u8 = .{0} ** (MAX_QUEUE_SIZE / 8);
+    var count: usize = 0;
+    var idx = head;
+
+    while (true) {
+        if (count >= descs.len) return error.DescChainTooLong;
+        if (idx >= self.size) return error.InvalidDescIndex;
+
+        // Cycle detection
+        const byte = idx / 8;
+        const bit: u3 = @intCast(idx % 8);
+        if (visited[byte] & (@as(u8, 1) << bit) != 0) return error.DescChainCycle;
+        visited[byte] |= @as(u8, 1) << bit;
+
+        descs[count] = try self.getDesc(mem, idx);
+        count += 1;
+        if (descs[count - 1].flags & virtio.DESC_F_NEXT != 0) {
+            idx = descs[count - 1].next;
+        } else {
+            break;
+        }
+    }
+    return count;
+}
+
 /// Pop the next available descriptor chain head. Returns null if none available.
 pub fn popAvail(self: *Self, mem: *Memory) !?u16 {
     const avail_idx = try self.getAvailIdx(mem);

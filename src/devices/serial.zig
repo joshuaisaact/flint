@@ -102,7 +102,10 @@ fn writeReg(self: *Self, offset: u16, value: u8) void {
         THR => {
             // Write character to output
             const buf = [1]u8{value};
-            _ = std.os.linux.write(self.output_fd, &buf, 1);
+            if (self.output_fd >= 0) {
+                const rc: isize = @bitCast(std.os.linux.write(self.output_fd, &buf, 1));
+                if (rc < 0) log.warn("serial write failed", .{});
+            }
             // If THRE interrupt enabled, signal TX complete
             if (self.ier & IER_THRE != 0) {
                 self.iir = (self.iir & 0xF0) | IIR_THR_EMPTY;

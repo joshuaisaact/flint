@@ -47,12 +47,6 @@ pub fn getVcpuMmapSize(self: Self) !usize {
     return try abi.ioctl(self.fd, c.KVM_GET_VCPU_MMAP_SIZE, 0);
 }
 
-/// Check if a KVM extension is supported.
-pub fn checkExtension(self: Self, extension: u32) !bool {
-    const ret = try abi.ioctl(self.fd, c.KVM_CHECK_EXTENSION, extension);
-    return ret > 0;
-}
-
 /// Maximum CPUID entries we support.
 pub const MAX_CPUID_ENTRIES = 256;
 
