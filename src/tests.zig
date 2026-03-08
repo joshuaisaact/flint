@@ -281,14 +281,17 @@ test "seccomp: filter starts with arch check and ends with allow" {
     try std.testing.expectEqual(@as(u16, 0x06), filter[filter.len - 1].code); // BPF_RET
     try std.testing.expectEqual(@as(u32, 0x7FFF0000), filter[filter.len - 1].k); // ALLOW
 
-    // Second-to-last is the default action (KILL_PROCESS)
-    try std.testing.expectEqual(@as(u32, 0x80000000), filter[filter.len - 2].k);
+    // Default action sits right after dispatch block (index 4 + N_simple + 3)
+    // Layout: [header:4] [simple:N] [dispatch:3] [default:1] [clone:4] [socket:3] [mprotect:4] [allow:1]
+    const N = filter.len - 20; // simple_syscalls.len
+    try std.testing.expectEqual(@as(u32, 0x80000000), filter[4 + N + 3].k); // KILL_PROCESS
 }
 
 test "seccomp: log filter uses LOG as default action" {
     const filter = &seccomp_mod.log_filter;
-    // Second-to-last instruction should be LOG, not KILL
-    try std.testing.expectEqual(@as(u32, 0x7FFC0000), filter[filter.len - 2].k); // RET_LOG
+    const N = filter.len - 20;
+    // Default action position uses LOG instead of KILL
+    try std.testing.expectEqual(@as(u32, 0x7FFC0000), filter[4 + N + 3].k); // RET_LOG
 }
 
 test "snapshot: header version validation" {

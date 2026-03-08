@@ -58,22 +58,38 @@ pub fn setup(config: Config) !void {
 
     // Create device nodes inside the jail (only what the VMM needs)
     try check(linux.mkdir("dev", 0o755), "mkdir(/dev)");
-    try check(linux.mknod("dev/kvm", S_IFCHR | 0o666, DEV_KVM), "mknod(/dev/kvm)");
+    try check(linux.mknod("dev/kvm", S_IFCHR | 0o660, DEV_KVM), "mknod(/dev/kvm)");
 
     if (config.need_tun) {
         try check(linux.mkdir("dev/net", 0o755), "mkdir(/dev/net)");
-        try check(linux.mknod("dev/net/tun", S_IFCHR | 0o666, DEV_NET_TUN), "mknod(/dev/net/tun)");
+        try check(linux.mknod("dev/net/tun", S_IFCHR | 0o660, DEV_NET_TUN), "mknod(/dev/net/tun)");
     }
 
     // Drop privileges — last step requiring root
     try check(linux.setgid(config.gid), "setgid");
     try check(linux.setuid(config.uid), "setuid");
 
+    // Prevent ptrace and core dumps from leaking VM memory
+    const rc: isize = @bitCast(linux.prctl(@intFromEnum(linux.PR.SET_DUMPABLE), 0, 0, 0, 0));
+    if (rc < 0) {
+        log.warn("prctl(SET_DUMPABLE) failed: {}", .{rc});
+    }
+
     log.info("jail active: uid={} gid={}", .{ config.uid, config.gid });
 }
 
 fn setupCgroup(name: [*:0]const u8) !void {
     const name_len = std.mem.indexOfSentinel(u8, 0, name);
+    const name_slice = name[0..name_len];
+
+    // Reject path traversal and absolute paths in cgroup name
+    if (name_len == 0 or name_slice[0] == '/' or
+        std.mem.indexOf(u8, name_slice, "..") != null)
+    {
+        log.err("invalid cgroup name: {s}", .{name_slice});
+        return error.InvalidCgroupName;
+    }
+
     const prefix = "/sys/fs/cgroup/";
 
     var path_buf: [256]u8 = undefined;
@@ -103,9 +119,10 @@ fn setupCgroup(name: [*:0]const u8) !void {
 }
 
 fn writeFile(path: [*:0]const u8, data: []const u8) !void {
-    const rc = linux.open(path, .{ .ACCMODE = .WRONLY }, 0);
-    const fd: isize = @bitCast(rc);
-    if (fd < 0) return error.OpenFailed;
-    defer _ = linux.close(@intCast(@as(usize, @bitCast(fd))));
-    _ = linux.write(@intCast(@as(usize, @bitCast(fd))), data.ptr, data.len);
+    const rc: isize = @bitCast(linux.open(path, .{ .ACCMODE = .WRONLY }, 0));
+    if (rc < 0) return error.OpenFailed;
+    const fd: linux.fd_t = @intCast(rc);
+    defer _ = linux.close(fd);
+    const wrc: isize = @bitCast(linux.write(fd, data.ptr, data.len));
+    if (wrc < 0) return error.WriteFailed;
 }

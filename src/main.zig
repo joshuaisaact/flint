@@ -171,6 +171,10 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("invalid --jail-gid\n", .{});
             std.process.exit(1);
         };
+        if (uid == 0 or gid == 0) {
+            std.debug.print("--jail-uid and --jail-gid must be non-zero (jail must drop root)\n", .{});
+            std.process.exit(1);
+        }
         try jail.setup(.{
             .jail_dir = jd,
             .uid = uid,
