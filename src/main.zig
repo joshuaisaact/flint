@@ -12,6 +12,8 @@ const c = abi.c;
 const boot_params = @import("boot/params.zig");
 const api = @import("api.zig");
 const snapshot = @import("snapshot.zig");
+const jail = @import("jail.zig");
+const seccomp = @import("seccomp.zig");
 
 const log = std.log.scoped(.flint);
 
@@ -65,6 +67,11 @@ pub fn main(init: std.process.Init) !void {
     var save_on_halt = false;
     var vmstate_path: [*:0]const u8 = "snapshot.vmstate";
     var mem_snap_path: [*:0]const u8 = "snapshot.mem";
+    var jail_dir: ?[*:0]const u8 = null;
+    var jail_uid: ?[*:0]const u8 = null;
+    var jail_gid: ?[*:0]const u8 = null;
+    var jail_cgroup: ?[*:0]const u8 = null;
+    var seccomp_audit = false;
     var cmdline: [*:0]const u8 = DEFAULT_CMDLINE;
     var got_initrd = false;
 
@@ -110,6 +117,28 @@ pub fn main(init: std.process.Init) !void {
                 std.debug.print("--mem-path requires an argument\n", .{});
                 std.process.exit(1);
             };
+        } else if (std.mem.eql(u8, s, "--jail")) {
+            jail_dir = args.next() orelse {
+                std.debug.print("--jail requires an argument\n", .{});
+                std.process.exit(1);
+            };
+        } else if (std.mem.eql(u8, s, "--jail-uid")) {
+            jail_uid = args.next() orelse {
+                std.debug.print("--jail-uid requires an argument\n", .{});
+                std.process.exit(1);
+            };
+        } else if (std.mem.eql(u8, s, "--jail-gid")) {
+            jail_gid = args.next() orelse {
+                std.debug.print("--jail-gid requires an argument\n", .{});
+                std.process.exit(1);
+            };
+        } else if (std.mem.eql(u8, s, "--jail-cgroup")) {
+            jail_cgroup = args.next() orelse {
+                std.debug.print("--jail-cgroup requires an argument\n", .{});
+                std.process.exit(1);
+            };
+        } else if (std.mem.eql(u8, s, "--seccomp-audit")) {
+            seccomp_audit = true;
         } else if (std.mem.indexOfScalar(u8, s, '=') != null) {
             cmdline = arg;
         } else if (kernel_path == null) {
@@ -118,6 +147,43 @@ pub fn main(init: std.process.Init) !void {
             initrd_path = arg;
             got_initrd = true;
         }
+    }
+
+    // Jail setup runs before anything else — after this, the process is
+    // in a mount namespace with pivot_root'd filesystem and dropped privileges.
+    // All file paths (kernel, initrd, disk) must be relative to the jail root.
+    if (jail_dir) |jd| {
+        const uid_str = jail_uid orelse {
+            std.debug.print("--jail requires --jail-uid\n", .{});
+            std.process.exit(1);
+        };
+        const gid_str = jail_gid orelse {
+            std.debug.print("--jail requires --jail-gid\n", .{});
+            std.process.exit(1);
+        };
+        const uid_len = std.mem.indexOfSentinel(u8, 0, uid_str);
+        const gid_len = std.mem.indexOfSentinel(u8, 0, gid_str);
+        const uid = std.fmt.parseUnsigned(u32, uid_str[0..uid_len], 10) catch {
+            std.debug.print("invalid --jail-uid\n", .{});
+            std.process.exit(1);
+        };
+        const gid = std.fmt.parseUnsigned(u32, gid_str[0..gid_len], 10) catch {
+            std.debug.print("invalid --jail-gid\n", .{});
+            std.process.exit(1);
+        };
+        try jail.setup(.{
+            .jail_dir = jd,
+            .uid = uid,
+            .gid = gid,
+            .cgroup = jail_cgroup,
+            .need_tun = tap_name != null,
+        });
+    }
+
+    // Seccomp filter — installed after jail (jail needs mount/mknod/setuid)
+    // but before any guest interaction
+    if (jail_dir != null or seccomp_audit) {
+        try seccomp.install(seccomp_audit);
     }
 
     if (restore_mode) {
@@ -146,6 +212,8 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("usage: flint <kernel> [initrd] [--disk <path>] [--tap <name>] [cmdline]\n", .{});
         std.debug.print("       flint --restore [--vmstate-path <path>] [--mem-path <path>]\n", .{});
         std.debug.print("       flint --api-sock <path>\n", .{});
+        std.debug.print("       --jail <dir> --jail-uid <uid> --jail-gid <gid> [--jail-cgroup <name>]\n", .{});
+        std.debug.print("       --seccomp-audit  (log violations instead of killing)\n", .{});
         std.process.exit(1);
     }
 }

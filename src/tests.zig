@@ -7,6 +7,7 @@ const boot_params = @import("boot/params.zig");
 const Serial = @import("devices/serial.zig");
 const Queue = @import("devices/virtio/queue.zig");
 const snapshot = @import("snapshot.zig");
+const seccomp_mod = @import("seccomp.zig");
 
 
 // -- Memory tests --
@@ -258,6 +259,36 @@ test "snapshot: header magic validation" {
     // Corrupt magic
     buf[0] = 'X';
     try std.testing.expectError(error.InvalidSnapshot, snapshot.readHeader(buf));
+}
+
+// -- Seccomp tests --
+
+test "seccomp: filter starts with arch check and ends with allow" {
+    const filter = &seccomp_mod.kill_filter;
+
+    // First instruction loads arch (BPF_LD | BPF_W | BPF_ABS at offset 4)
+    try std.testing.expectEqual(@as(u16, 0x20), filter[0].code); // BPF_LD|BPF_W|BPF_ABS
+    try std.testing.expectEqual(@as(u32, 4), filter[0].k); // offset of arch in seccomp_data
+
+    // Second instruction checks arch == x86_64
+    try std.testing.expectEqual(@as(u32, 0xC000003E), filter[1].k); // AUDIT_ARCH_X86_64
+
+    // Third instruction kills on wrong arch
+    try std.testing.expectEqual(@as(u16, 0x06), filter[2].code); // BPF_RET
+    try std.testing.expectEqual(@as(u32, 0x80000000), filter[2].k); // KILL_PROCESS
+
+    // Last instruction allows
+    try std.testing.expectEqual(@as(u16, 0x06), filter[filter.len - 1].code); // BPF_RET
+    try std.testing.expectEqual(@as(u32, 0x7FFF0000), filter[filter.len - 1].k); // ALLOW
+
+    // Second-to-last is the default action (KILL_PROCESS)
+    try std.testing.expectEqual(@as(u32, 0x80000000), filter[filter.len - 2].k);
+}
+
+test "seccomp: log filter uses LOG as default action" {
+    const filter = &seccomp_mod.log_filter;
+    // Second-to-last instruction should be LOG, not KILL
+    try std.testing.expectEqual(@as(u32, 0x7FFC0000), filter[filter.len - 2].k); // RET_LOG
 }
 
 test "snapshot: header version validation" {

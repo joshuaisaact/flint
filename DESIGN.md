@@ -51,6 +51,9 @@ A lightweight KVM-based Virtual Machine Monitor (VMM) written in Zig, designed f
 src/
   main.zig          -- entry point, arg parsing, register setup, run loop
   api.zig           -- REST API server (Unix socket, HTTP/1.1, JSON)
+  snapshot.zig      -- VM state save/load orchestrator
+  jail.zig          -- mount namespace, pivot_root, cgroup, privilege drop
+  seccomp.zig       -- BPF syscall filter (comptime-generated whitelist)
   memory.zig        -- guest physical memory management (mmap regions)
   tests.zig         -- unit tests
   kvm/
@@ -173,8 +176,12 @@ Priority order optimized for AI agent code execution sandbox use case:
 3. **VM pool / warm start** -- pre-fork a pool of restored VMs ready for immediate use.
    Combined with snapshots, this gives near-instant sandbox provisioning.
 
-4. **Seccomp + jailer** -- syscall filtering and namespace/cgroup isolation for the VMM
-   process itself. Defense in depth: even if a guest escapes KVM, the VMM is sandboxed.
+4. ~~**Seccomp + jailer**~~ -- DONE. In-process `--jail` flag: mount namespace +
+   pivot_root for filesystem isolation, device node creation (/dev/kvm, /dev/net/tun),
+   cgroups v2 for resource limits, privilege drop (setuid/setgid), seccomp BPF filter
+   (44 whitelisted syscalls, KILL_PROCESS default). `--seccomp-audit` mode for
+   development (LOG instead of KILL). All file paths relative to jail root after
+   pivot_root.
 
 5. **Higher-level sandbox API** -- extend the REST API with sandbox-oriented endpoints:
    execute code, stream stdout/stderr, upload/download files, set timeouts and resource
