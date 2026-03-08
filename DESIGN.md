@@ -64,34 +64,15 @@ src/
     serial.zig      -- 16550 UART emulation (COM1, IRQ 4)
 ```
 
-Planned additions for Phase 3:
 ```
   devices/
-    device.zig      -- Device tagged union + IO/MMIO dispatch bus
+    serial.zig      -- 16550 UART emulation (COM1, IRQ 4)
+    virtio.zig      -- virtio common constants (MMIO offsets, status, features)
     virtio/
-      mmio.zig      -- virtio-mmio transport
-      block.zig     -- virtio-blk device
-      net.zig       -- virtio-net device
-      queue.zig     -- virtqueue implementation
+      mmio.zig      -- virtio-mmio v2 transport layer
+      blk.zig       -- virtio-blk device backend
+      queue.zig     -- split virtqueue (desc table, avail/used rings)
 ```
-
-### Device emulation via tagged union
-
-```zig
-const Device = union(enum) {
-    serial: Serial,
-    virtio_block: VirtioBlock,
-    virtio_net: VirtioNet,
-
-    pub fn handle_io(self: *Device, port: u16, data: []u8, is_write: bool) void {
-        switch (self.*) {
-            inline else => |*dev| dev.handle_io(port, data, is_write),
-        }
-    }
-};
-```
-
-Small, closed, known-at-comptime set. `inline else` generates per-variant dispatch resolved at comptime.
 
 ### Memory model
 
@@ -130,14 +111,21 @@ Small, closed, known-at-comptime set. `inline else` generates per-variant dispat
 - 18 unit tests (memory, boot params, serial)
 - **Result: boots to busybox initramfs, runs shell scripts, ~1 second to userspace**
 
-### Phase 3: Storage + networking -- NEXT
-- virtio-mmio transport layer
-- virtio-block (backed by a file)
-- virtio-net (backed by TAP device, vhost-net acceleration)
+### Phase 3: Storage -- DONE
+- virtio-mmio v2 (modern) transport layer with full register interface
+- virtio-blk device backend (pread/pwrite against a backing file)
+- Split virtqueue implementation (descriptor table, available ring, used ring)
+- MMIO exit handling in run loop with IRQ injection
+- Kernel cmdline auto-extended with `virtio_mmio.device=` for device discovery
+- Security hardening: sector bounds validation, host-side used_idx (TOCTOU prevention),
+  queue size validation (power-of-2), bounded avail ring processing, O_CLOEXEC on all fds
+- **Result: guest mounts ext4 disk images via /dev/vda, reads/writes/flushes work correctly**
+
+### Phase 3b: Networking -- NEXT
+- virtio-net device (backed by TAP device)
+- vhost-net kernel acceleration
 - `ioeventfd`/`irqfd` for kernel-bypass notifications
-- Device bus abstraction (tagged union dispatch for IO/MMIO)
-- MMIO exit handling in run loop
-- Memory region split around MMIO gap
+- Multiple virtqueue support (RX + TX queues)
 
 ### Phase 4: Production concerns
 - REST API server (Unix socket, JSON)
