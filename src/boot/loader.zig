@@ -18,7 +18,7 @@ pub const LoadResult = struct {
 /// Read an entire file into memory using linux syscalls.
 /// Caller owns the returned slice and must free it with page_allocator.
 fn readFile(path: [*:0]const u8) ![]u8 {
-    const open_rc: isize = @bitCast(linux.open(path, .{ .ACCMODE = .RDONLY }, 0));
+    const open_rc: isize = @bitCast(linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0));
     if (open_rc < 0) return error.OpenFailed;
     const fd: i32 = @intCast(open_rc);
     defer _ = linux.close(fd);

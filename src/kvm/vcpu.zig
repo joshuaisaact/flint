@@ -93,3 +93,21 @@ pub const IoExit = struct {
     count: u32,
     data: [*]u8,
 };
+
+/// Get the MMIO exit data (valid when exit_reason == KVM_EXIT_MMIO).
+pub fn getMmioData(self: Self) MmioExit {
+    const mmio = self.kvm_run.unnamed_0.mmio;
+    return .{
+        .phys_addr = mmio.phys_addr,
+        .data = mmio.data,
+        .len = mmio.len,
+        .is_write = mmio.is_write != 0,
+    };
+}
+
+pub const MmioExit = struct {
+    phys_addr: u64,
+    data: [8]u8,
+    len: u32,
+    is_write: bool,
+};

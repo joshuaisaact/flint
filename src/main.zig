@@ -5,6 +5,8 @@ const Vcpu = @import("kvm/vcpu.zig");
 const Memory = @import("memory.zig");
 const loader = @import("boot/loader.zig");
 const Serial = @import("devices/serial.zig");
+const VirtioMmio = @import("devices/virtio/mmio.zig");
+const virtio = @import("devices/virtio.zig");
 const abi = @import("kvm/abi.zig");
 const c = abi.c;
 const boot_params = @import("boot/params.zig");
@@ -19,26 +21,34 @@ pub fn main(init: std.process.Init.Minimal) !void {
     _ = args.skip(); // program name
 
     const kernel_path = args.next() orelse {
-        std.debug.print("usage: flint <kernel-bzimage> [initrd] [command line]\n", .{});
+        std.debug.print("usage: flint <kernel-bzimage> [initrd] [disk] [command line]\n", .{});
         std.process.exit(1);
     };
 
-    // Second arg is initrd if it doesn't look like a cmdline (heuristic: cmdlines contain '=')
-    const second = args.next();
-    const initrd_path: ?[*:0]const u8, const cmdline: [*:0]const u8 = blk: {
-        if (second) |s| {
-            const len = std.mem.indexOfSentinel(u8, 0, s);
-            if (std.mem.indexOfScalar(u8, s[0..len], '=') != null) {
-                break :blk .{ null, s }; // it's a cmdline
-            }
-            break :blk .{ s, args.next() orelse DEFAULT_CMDLINE };
+    // Parse remaining args: files (no '=') come first, then cmdline (contains '=')
+    var initrd_path: ?[*:0]const u8 = null;
+    var disk_path: ?[*:0]const u8 = null;
+    var cmdline: [*:0]const u8 = DEFAULT_CMDLINE;
+
+    var file_args: u32 = 0;
+    while (args.next()) |arg| {
+        const len = std.mem.indexOfSentinel(u8, 0, arg);
+        if (std.mem.indexOfScalar(u8, arg[0..len], '=') != null) {
+            cmdline = arg; // it's a cmdline
+            break;
         }
-        break :blk .{ null, DEFAULT_CMDLINE };
-    };
+        if (file_args == 0) {
+            initrd_path = arg;
+        } else if (file_args == 1) {
+            disk_path = arg;
+        }
+        file_args += 1;
+    }
 
     log.info("flint starting", .{});
     log.info("kernel: {s}", .{kernel_path});
     if (initrd_path) |p| log.info("initrd: {s}", .{p});
+    if (disk_path) |p| log.info("disk: {s}", .{p});
     log.info("cmdline: {s}", .{cmdline});
 
     // 1. Open KVM
@@ -63,10 +73,32 @@ pub fn main(init: std.process.Init.Minimal) !void {
     try vm.createIrqChip();
     try vm.createPit2();
 
-    // 6. Load the kernel (and initrd if provided)
-    const boot = try loader.loadBzImage(&mem, kernel_path, initrd_path, cmdline);
+    // 6. Set up virtio-blk if disk provided
+    var virtio_blk: ?VirtioMmio = null;
+    defer if (virtio_blk) |*vb| vb.deinit();
+    var cmdline_buf: [512]u8 = undefined;
+    var effective_cmdline: [*:0]const u8 = cmdline;
+    if (disk_path) |dp| {
+        virtio_blk = try VirtioMmio.initBlk(virtio.MMIO_BASE, virtio.IRQ_BASE, dp);
+        // Append virtio_mmio.device= parameter to kernel cmdline
+        const base_cmdline = cmdline[0..std.mem.indexOfSentinel(u8, 0, cmdline)];
+        const suffix = std.fmt.bufPrint(&cmdline_buf, "{s} virtio_mmio.device=4K@0x{x}:{d}", .{
+            base_cmdline, virtio.MMIO_BASE, virtio.IRQ_BASE,
+        }) catch {
+            log.err("cmdline buffer too small", .{});
+            return error.CmdlineTooLong;
+        };
+        // Null-terminate in the buffer
+        if (suffix.len < cmdline_buf.len) {
+            cmdline_buf[suffix.len] = 0;
+            effective_cmdline = @ptrCast(&cmdline_buf);
+        }
+    }
 
-    // 7. Create vCPU and set up registers
+    // 7. Load the kernel (and initrd if provided)
+    const boot = try loader.loadBzImage(&mem, kernel_path, initrd_path, effective_cmdline);
+
+    // 8. Create vCPU and set up registers
     const vcpu_mmap_size = try kvm.getVcpuMmapSize();
     var vcpu = try vm.createVcpu(0, vcpu_mmap_size);
     defer vcpu.deinit();
@@ -77,12 +109,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     try setupRegisters(&vcpu, boot, &mem);
 
-    // 8. Set up devices
+    // 9. Set up devices
     var serial = Serial.init(1); // stdout fd
 
-    // 9. Run
+    // 10. Run
     log.info("entering VM run loop", .{});
-    try runLoop(&vcpu, &serial, &vm);
+    try runLoop(&vcpu, &serial, &vm, &mem, if (virtio_blk) |*vb| vb else null);
 }
 
 // Memory layout for boot structures (all below boot_params at 0x7000)
@@ -180,7 +212,15 @@ fn setupRegisters(vcpu: *Vcpu, boot: loader.LoadResult, mem: *Memory) !void {
     log.info("registers configured: rip=0x{x} (startup_64) rsi=0x{x}", .{ regs.rip, regs.rsi });
 }
 
-fn runLoop(vcpu: *Vcpu, serial: *Serial, vm: *const Vm) !void {
+fn injectIrq(vm: *const Vm, irq: u32) void {
+    vm.setIrqLine(irq, 1) catch |err| {
+        log.warn("setIrqLine high: {}", .{err});
+        return;
+    };
+    vm.setIrqLine(irq, 0) catch |err| log.warn("setIrqLine low: {}", .{err});
+}
+
+fn runLoop(vcpu: *Vcpu, serial: *Serial, vm: *const Vm, mem: *Memory, blk_dev: ?*VirtioMmio) !void {
     var exit_count: u64 = 0;
     while (true) {
         const exit_reason = vcpu.run() catch |err| {
@@ -201,8 +241,33 @@ fn runLoop(vcpu: *Vcpu, serial: *Serial, vm: *const Vm) !void {
                         serial.handleIo(io.port, io.data[offset..][0..io.size], is_write);
                     }
                     if (serial.hasPendingIrq()) {
-                        vm.setIrqLine(Serial.IRQ, 1) catch |err| log.warn("setIrqLine: {}", .{err});
-                        vm.setIrqLine(Serial.IRQ, 0) catch |err| log.warn("setIrqLine: {}", .{err});
+                        injectIrq(vm, Serial.IRQ);
+                    }
+                }
+            },
+            c.KVM_EXIT_MMIO => {
+                const mmio = vcpu.getMmioData();
+                const len = @min(mmio.len, 8);
+                if (blk_dev) |dev| {
+                    if (dev.matchesAddr(mmio.phys_addr)) {
+                        const offset = mmio.phys_addr - dev.mmio_base;
+                        if (mmio.is_write) {
+                            const data: [8]u8 = mmio.data;
+                            dev.handleWrite(offset, data[0..len]);
+
+                            // If this was a queue notify, process queues and inject IRQ
+                            if (offset == virtio.MMIO_QUEUE_NOTIFY) {
+                                if (dev.processQueues(mem)) {
+                                    injectIrq(vm, dev.irq);
+                                }
+                            }
+                        } else {
+                            // Read: device fills data, write back to kvm_run
+                            var data: [8]u8 = .{0} ** 8;
+                            dev.handleRead(offset, data[0..len]);
+                            const run_mmio = &vcpu.kvm_run.unnamed_0.mmio;
+                            run_mmio.data = data;
+                        }
                     }
                 }
             },
@@ -233,9 +298,6 @@ fn runLoop(vcpu: *Vcpu, serial: *Serial, vm: *const Vm) !void {
                     log.err("  rip=0x{x} rsp=0x{x}", .{ regs.rip, regs.rsp });
                 } else |_| {}
                 return error.VmInternalError;
-            },
-            c.KVM_EXIT_MMIO => {
-                // Silently ignore unhandled MMIO (guest probing non-existent devices)
             },
             else => {
                 log.warn("unhandled exit reason: {}", .{exit_reason});

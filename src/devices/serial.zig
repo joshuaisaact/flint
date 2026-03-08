@@ -80,6 +80,14 @@ pub fn handleIo(self: *Self, port: u16, data: []u8, is_write: bool) void {
     }
 }
 
+pub fn handleIoWrite(self: *Self, port: u16, data: []const u8) void {
+    self.writeReg(port - COM1_PORT, data[0]);
+}
+
+pub fn handleIoRead(self: *Self, port: u16, data: []u8) void {
+    data[0] = self.readReg(port - COM1_PORT);
+}
+
 fn writeReg(self: *Self, offset: u16, value: u8) void {
     if (self.lcr & LCR_DLAB != 0 and offset <= 1) {
         switch (offset) {

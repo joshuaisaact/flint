@@ -21,11 +21,12 @@ pub fn open() !Self {
         return error.KvmUnavailable;
     };
 
+    errdefer abi.close(fd);
+
     // Check API version
     const version = try abi.ioctl(fd, c.KVM_GET_API_VERSION, 0);
     if (version != 12) {
         log.err("unexpected KVM API version: {}, expected 12", .{version});
-        abi.close(fd);
         return error.UnsupportedApiVersion;
     }
 

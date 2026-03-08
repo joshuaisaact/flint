@@ -110,11 +110,11 @@ test "serial: write outputs to THR" {
 
     // Enable THRE interrupt
     const ier_data = [1]u8{0x02}; // IER_THRE
-    serial.handleIo(Serial.COM1_PORT + 1, @constCast(&ier_data), true);
+    serial.handleIoWrite(Serial.COM1_PORT + 1, &ier_data);
 
     // Write a character
     const thr_data = [1]u8{'A'};
-    serial.handleIo(Serial.COM1_PORT, @constCast(&thr_data), true);
+    serial.handleIoWrite(Serial.COM1_PORT, &thr_data);
 
     // Should have pending IRQ
     try std.testing.expect(serial.hasPendingIrq());
@@ -126,7 +126,7 @@ test "serial: LSR always reports transmitter ready" {
     var serial = Serial.init(-1);
 
     var data = [1]u8{0};
-    serial.handleIo(Serial.COM1_PORT + 5, &data, false); // read LSR
+    serial.handleIoRead(Serial.COM1_PORT + 5, &data); // read LSR
     try std.testing.expect(data[0] & 0x60 == 0x60); // THRE + TEMT
 }
 
@@ -135,15 +135,15 @@ test "serial: DLAB mode accesses divisor latch" {
 
     // Set DLAB
     const lcr_data = [1]u8{0x80};
-    serial.handleIo(Serial.COM1_PORT + 3, @constCast(&lcr_data), true);
+    serial.handleIoWrite(Serial.COM1_PORT + 3, &lcr_data);
 
     // Write divisor latch low
     const dll_data = [1]u8{0x42};
-    serial.handleIo(Serial.COM1_PORT, @constCast(&dll_data), true);
+    serial.handleIoWrite(Serial.COM1_PORT, &dll_data);
 
     // Read it back
     var read_data = [1]u8{0};
-    serial.handleIo(Serial.COM1_PORT, &read_data, false);
+    serial.handleIoRead(Serial.COM1_PORT, &read_data);
     try std.testing.expectEqual(@as(u8, 0x42), read_data[0]);
 }
 
@@ -152,15 +152,15 @@ test "serial: IIR read clears THR empty interrupt" {
 
     // Enable THRE interrupt
     const ier_data = [1]u8{0x02};
-    serial.handleIo(Serial.COM1_PORT + 1, @constCast(&ier_data), true);
+    serial.handleIoWrite(Serial.COM1_PORT + 1, &ier_data);
 
     // Read IIR -- should show THR empty (0x02 in low nibble)
     var iir_data = [1]u8{0};
-    serial.handleIo(Serial.COM1_PORT + 2, &iir_data, false);
+    serial.handleIoRead(Serial.COM1_PORT + 2, &iir_data);
     try std.testing.expectEqual(@as(u8, 0x02), iir_data[0] & 0x0F);
 
     // Read IIR again -- should be cleared to no-interrupt (0x01)
-    serial.handleIo(Serial.COM1_PORT + 2, &iir_data, false);
+    serial.handleIoRead(Serial.COM1_PORT + 2, &iir_data);
     try std.testing.expectEqual(@as(u8, 0x01), iir_data[0] & 0x0F);
 }
 
@@ -169,16 +169,16 @@ test "serial: MSR is read-only" {
 
     // Read default MSR (should have DCD+DSR+CTS)
     var data = [1]u8{0};
-    serial.handleIo(Serial.COM1_PORT + 6, &data, false);
+    serial.handleIoRead(Serial.COM1_PORT + 6, &data);
     const original = data[0];
     try std.testing.expect(original != 0); // has some bits set
 
     // Try to write MSR
     const write_data = [1]u8{0x00};
-    serial.handleIo(Serial.COM1_PORT + 6, @constCast(&write_data), true);
+    serial.handleIoWrite(Serial.COM1_PORT + 6, &write_data);
 
     // Read back -- should be unchanged
-    serial.handleIo(Serial.COM1_PORT + 6, &data, false);
+    serial.handleIoRead(Serial.COM1_PORT + 6, &data);
     try std.testing.expectEqual(original, data[0]);
 }
 
@@ -186,9 +186,9 @@ test "serial: scratch register is read-write" {
     var serial = Serial.init(-1);
 
     const write_data = [1]u8{0xAB};
-    serial.handleIo(Serial.COM1_PORT + 7, @constCast(&write_data), true);
+    serial.handleIoWrite(Serial.COM1_PORT + 7, &write_data);
 
     var read_data = [1]u8{0};
-    serial.handleIo(Serial.COM1_PORT + 7, &read_data, false);
+    serial.handleIoRead(Serial.COM1_PORT + 7, &read_data);
     try std.testing.expectEqual(@as(u8, 0xAB), read_data[0]);
 }
