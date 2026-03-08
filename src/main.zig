@@ -21,34 +21,43 @@ pub fn main(init: std.process.Init.Minimal) !void {
     _ = args.skip(); // program name
 
     const kernel_path = args.next() orelse {
-        std.debug.print("usage: flint <kernel-bzimage> [initrd] [disk] [command line]\n", .{});
+        std.debug.print("usage: flint <kernel> [initrd] [--disk <path>] [--tap <name>] [cmdline]\n", .{});
         std.process.exit(1);
     };
 
-    // Parse remaining args: files (no '=') come first, then cmdline (contains '=')
+    // Parse remaining args
     var initrd_path: ?[*:0]const u8 = null;
     var disk_path: ?[*:0]const u8 = null;
+    var tap_name: ?[*:0]const u8 = null;
     var cmdline: [*:0]const u8 = DEFAULT_CMDLINE;
+    var got_initrd = false;
 
-    var file_args: u32 = 0;
     while (args.next()) |arg| {
         const len = std.mem.indexOfSentinel(u8, 0, arg);
-        if (std.mem.indexOfScalar(u8, arg[0..len], '=') != null) {
-            cmdline = arg; // it's a cmdline
-            break;
-        }
-        if (file_args == 0) {
+        const s = arg[0..len];
+        if (std.mem.eql(u8, s, "--disk")) {
+            disk_path = args.next() orelse {
+                std.debug.print("--disk requires an argument\n", .{});
+                std.process.exit(1);
+            };
+        } else if (std.mem.eql(u8, s, "--tap")) {
+            tap_name = args.next() orelse {
+                std.debug.print("--tap requires an argument\n", .{});
+                std.process.exit(1);
+            };
+        } else if (std.mem.indexOfScalar(u8, s, '=') != null) {
+            cmdline = arg;
+        } else if (!got_initrd) {
             initrd_path = arg;
-        } else if (file_args == 1) {
-            disk_path = arg;
+            got_initrd = true;
         }
-        file_args += 1;
     }
 
     log.info("flint starting", .{});
     log.info("kernel: {s}", .{kernel_path});
     if (initrd_path) |p| log.info("initrd: {s}", .{p});
     if (disk_path) |p| log.info("disk: {s}", .{p});
+    if (tap_name) |p| log.info("tap: {s}", .{p});
     log.info("cmdline: {s}", .{cmdline});
 
     // 1. Open KVM
@@ -73,24 +82,51 @@ pub fn main(init: std.process.Init.Minimal) !void {
     try vm.createIrqChip();
     try vm.createPit2();
 
-    // 6. Set up virtio-blk if disk provided
-    var virtio_blk: ?VirtioMmio = null;
-    defer if (virtio_blk) |*vb| vb.deinit();
-    var cmdline_buf: [512]u8 = undefined;
-    var effective_cmdline: [*:0]const u8 = cmdline;
+    // 6. Set up virtio devices
+    var devices: [virtio.MAX_DEVICES]?VirtioMmio = .{null} ** virtio.MAX_DEVICES;
+    var device_count: u32 = 0;
+
     if (disk_path) |dp| {
-        virtio_blk = try VirtioMmio.initBlk(virtio.MMIO_BASE, virtio.IRQ_BASE, dp);
-        // Append virtio_mmio.device= parameter to kernel cmdline
+        const base = virtio.MMIO_BASE + @as(u64, device_count) * virtio.MMIO_SIZE;
+        const irq = virtio.IRQ_BASE + device_count;
+        devices[device_count] = try VirtioMmio.initBlk(base, irq, dp);
+        device_count += 1;
+    }
+
+    if (tap_name) |tn| {
+        const base = virtio.MMIO_BASE + @as(u64, device_count) * virtio.MMIO_SIZE;
+        const irq = virtio.IRQ_BASE + device_count;
+        devices[device_count] = try VirtioMmio.initNet(base, irq, tn);
+        device_count += 1;
+    }
+
+    defer for (&devices) |*d| {
+        if (d.*) |*dev| dev.deinit();
+    };
+
+    // Build cmdline with virtio_mmio.device= entries
+    var cmdline_buf: [1024]u8 = undefined;
+    var effective_cmdline: [*:0]const u8 = cmdline;
+    if (device_count > 0) {
+        var pos: usize = 0;
         const base_cmdline = cmdline[0..std.mem.indexOfSentinel(u8, 0, cmdline)];
-        const suffix = std.fmt.bufPrint(&cmdline_buf, "{s} virtio_mmio.device=4K@0x{x}:{d}", .{
-            base_cmdline, virtio.MMIO_BASE, virtio.IRQ_BASE,
-        }) catch {
-            log.err("cmdline buffer too small", .{});
-            return error.CmdlineTooLong;
-        };
-        // Null-terminate in the buffer
-        if (suffix.len < cmdline_buf.len) {
-            cmdline_buf[suffix.len] = 0;
+        @memcpy(cmdline_buf[pos..][0..base_cmdline.len], base_cmdline);
+        pos += base_cmdline.len;
+
+        for (0..device_count) |i| {
+            if (devices[i]) |dev| {
+                const entry = std.fmt.bufPrint(cmdline_buf[pos..], " virtio_mmio.device=4K@0x{x}:{d}", .{
+                    dev.mmio_base, dev.irq,
+                }) catch {
+                    log.err("cmdline buffer too small", .{});
+                    return error.CmdlineTooLong;
+                };
+                pos += entry.len;
+            }
+        }
+
+        if (pos < cmdline_buf.len) {
+            cmdline_buf[pos] = 0;
             effective_cmdline = @ptrCast(&cmdline_buf);
         }
     }
@@ -114,7 +150,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     // 10. Run
     log.info("entering VM run loop", .{});
-    try runLoop(&vcpu, &serial, &vm, &mem, if (virtio_blk) |*vb| vb else null);
+    try runLoop(&vcpu, &serial, &vm, &mem, &devices, device_count);
 }
 
 // Memory layout for boot structures (all below boot_params at 0x7000)
@@ -220,7 +256,9 @@ fn injectIrq(vm: *const Vm, irq: u32) void {
     vm.setIrqLine(irq, 0) catch |err| log.warn("setIrqLine low: {}", .{err});
 }
 
-fn runLoop(vcpu: *Vcpu, serial: *Serial, vm: *const Vm, mem: *Memory, blk_dev: ?*VirtioMmio) !void {
+const DeviceArray = [virtio.MAX_DEVICES]?VirtioMmio;
+
+fn runLoop(vcpu: *Vcpu, serial: *Serial, vm: *const Vm, mem: *Memory, devices: *DeviceArray, device_count: u32) !void {
     var exit_count: u64 = 0;
     while (true) {
         const exit_reason = vcpu.run() catch |err| {
@@ -228,6 +266,15 @@ fn runLoop(vcpu: *Vcpu, serial: *Serial, vm: *const Vm, mem: *Memory, blk_dev: ?
             return err;
         };
         exit_count +%= 1;
+
+        // Poll RX on net devices between VM exits
+        for (devices[0..device_count]) |*dev_opt| {
+            if (dev_opt.*) |*dev| {
+                if (dev.pollRx(mem)) {
+                    injectIrq(vm, dev.irq);
+                }
+            }
+        }
 
         switch (exit_reason) {
             c.KVM_EXIT_IO => {
@@ -248,25 +295,26 @@ fn runLoop(vcpu: *Vcpu, serial: *Serial, vm: *const Vm, mem: *Memory, blk_dev: ?
             c.KVM_EXIT_MMIO => {
                 const mmio = vcpu.getMmioData();
                 const len = @min(mmio.len, 8);
-                if (blk_dev) |dev| {
-                    if (dev.matchesAddr(mmio.phys_addr)) {
-                        const offset = mmio.phys_addr - dev.mmio_base;
-                        if (mmio.is_write) {
-                            const data: [8]u8 = mmio.data;
-                            dev.handleWrite(offset, data[0..len]);
+                for (devices[0..device_count]) |*dev_opt| {
+                    if (dev_opt.*) |*dev| {
+                        if (dev.matchesAddr(mmio.phys_addr)) {
+                            const offset = mmio.phys_addr - dev.mmio_base;
+                            if (mmio.is_write) {
+                                const data: [8]u8 = mmio.data;
+                                dev.handleWrite(offset, data[0..len]);
 
-                            // If this was a queue notify, process queues and inject IRQ
-                            if (offset == virtio.MMIO_QUEUE_NOTIFY) {
-                                if (dev.processQueues(mem)) {
-                                    injectIrq(vm, dev.irq);
+                                if (offset == virtio.MMIO_QUEUE_NOTIFY) {
+                                    if (dev.processQueues(mem)) {
+                                        injectIrq(vm, dev.irq);
+                                    }
                                 }
+                            } else {
+                                var data: [8]u8 = .{0} ** 8;
+                                dev.handleRead(offset, data[0..len]);
+                                const run_mmio = &vcpu.kvm_run.unnamed_0.mmio;
+                                run_mmio.data = data;
                             }
-                        } else {
-                            // Read: device fills data, write back to kvm_run
-                            var data: [8]u8 = .{0} ** 8;
-                            dev.handleRead(offset, data[0..len]);
-                            const run_mmio = &vcpu.kvm_run.unnamed_0.mmio;
-                            run_mmio.data = data;
+                            break; // each address matches at most one device
                         }
                     }
                 }

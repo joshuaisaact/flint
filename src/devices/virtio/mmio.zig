@@ -1,15 +1,22 @@
 // Virtio-MMIO transport layer.
 // Implements the MMIO register interface (v2/modern) for a single device.
+// Supports multiple backend device types via tagged union.
 
 const std = @import("std");
 const Memory = @import("../../memory.zig");
 const virtio = @import("../virtio.zig");
 const Queue = @import("queue.zig");
 const Blk = @import("blk.zig");
+const Net = @import("net.zig");
 
 const log = std.log.scoped(.virtio_mmio);
 
 const Self = @This();
+
+const Backend = union(enum) {
+    blk: Blk,
+    net: Net,
+};
 
 // Device identity
 device_id: u32,
@@ -25,11 +32,11 @@ queue_sel: u32 = 0,
 interrupt_status: u32 = 0,
 config_generation: u32 = 0,
 
-// Single queue for virtio-blk (requestq)
-queue: Queue = .{},
+// Queues: blk uses 1, net uses 2 (RX + TX)
+queues: [2]Queue = .{ .{}, .{} },
 
 // Backend
-blk: Blk,
+backend: Backend,
 
 pub fn initBlk(mmio_base: u64, irq: u32, disk_path: [*:0]const u8) !Self {
     const blk = try Blk.init(disk_path);
@@ -38,12 +45,40 @@ pub fn initBlk(mmio_base: u64, irq: u32, disk_path: [*:0]const u8) !Self {
         .device_id = virtio.DEVICE_ID_BLOCK,
         .mmio_base = mmio_base,
         .irq = irq,
-        .blk = blk,
+        .backend = .{ .blk = blk },
+    };
+}
+
+pub fn initNet(mmio_base: u64, irq: u32, tap_name: [*:0]const u8) !Self {
+    const net = try Net.init(tap_name);
+    log.info("virtio-net at MMIO 0x{x} IRQ {}", .{ mmio_base, irq });
+    return .{
+        .device_id = virtio.DEVICE_ID_NET,
+        .mmio_base = mmio_base,
+        .irq = irq,
+        .backend = .{ .net = net },
     };
 }
 
 pub fn deinit(self: *Self) void {
-    self.blk.deinit();
+    switch (self.backend) {
+        .blk => |b| b.deinit(),
+        .net => |n| n.deinit(),
+    }
+}
+
+fn numQueues(self: Self) u32 {
+    return switch (self.backend) {
+        .blk => 1,
+        .net => Net.NUM_QUEUES,
+    };
+}
+
+fn deviceFeatures(self: Self) u64 {
+    return switch (self.backend) {
+        .blk => Blk.deviceFeatures(),
+        .net => Net.deviceFeatures(),
+    };
 }
 
 fn reset(self: *Self) void {
@@ -53,11 +88,11 @@ fn reset(self: *Self) void {
     self.driver_features = 0;
     self.queue_sel = 0;
     self.interrupt_status = 0;
-    self.queue.reset();
+    for (&self.queues) |*q| q.reset();
 }
 
 fn selectedQueue(self: *Self) ?*Queue {
-    if (self.queue_sel == 0) return &self.queue;
+    if (self.queue_sel < self.numQueues()) return &self.queues[self.queue_sel];
     return null;
 }
 
@@ -72,8 +107,10 @@ fn setHigh32(target: *u64, val: u32) void {
 /// Handle an MMIO read. Returns the value to write back to the guest.
 pub fn handleRead(self: *Self, offset: u64, data: []u8) void {
     if (offset >= virtio.MMIO_CONFIG) {
-        // Device-specific config space
-        self.blk.readConfig(offset - virtio.MMIO_CONFIG, data);
+        switch (self.backend) {
+            .blk => |b| b.readConfig(offset - virtio.MMIO_CONFIG, data),
+            .net => |n| n.readConfig(offset - virtio.MMIO_CONFIG, data),
+        }
         return;
     }
 
@@ -89,7 +126,7 @@ pub fn handleRead(self: *Self, offset: u64, data: []u8) void {
         virtio.MMIO_DEVICE_ID => self.device_id,
         virtio.MMIO_VENDOR_ID => virtio.VENDOR_ID,
         virtio.MMIO_DEVICE_FEATURES => val: {
-            const features = Blk.deviceFeatures();
+            const features = self.deviceFeatures();
             break :val if (self.device_features_sel == 0)
                 @truncate(features)
             else
@@ -119,7 +156,6 @@ pub fn handleRead(self: *Self, offset: u64, data: []u8) void {
 /// Handle an MMIO write from the guest.
 pub fn handleWrite(self: *Self, offset: u64, data: []const u8) void {
     if (offset >= virtio.MMIO_CONFIG) {
-        // Config space writes (not used for blk, ignore)
         return;
     }
 
@@ -141,7 +177,6 @@ pub fn handleWrite(self: *Self, offset: u64, data: []const u8) void {
         virtio.MMIO_QUEUE_NUM => {
             if (self.selectedQueue()) |q| {
                 const size: u16 = @intCast(val & 0xFFFF);
-                // Validate: must be non-zero, power of 2, and <= MAX_QUEUE_SIZE
                 if (size == 0 or size > Queue.MAX_QUEUE_SIZE or @popCount(size) != 1) {
                     log.warn("rejected invalid queue size: {}", .{size});
                 } else {
@@ -196,34 +231,58 @@ pub fn handleWrite(self: *Self, offset: u64, data: []const u8) void {
     }
 }
 
-/// Process pending requests on the virtqueue.
+/// Process pending requests on the virtqueue(s).
 /// Returns true if any work was done (interrupt should be raised).
-/// Reads avail_idx once and caps processing to queue size to prevent DoS.
 pub fn processQueues(self: *Self, mem: *Memory) bool {
     if (self.status & virtio.STATUS_DRIVER_OK == 0) return false;
-    if (!self.queue.isReady()) return false;
 
     var did_work = false;
-    // Process at most queue.size entries per notify to bound work
-    var processed: u16 = 0;
-    while (processed < self.queue.size) : (processed += 1) {
-        const head = self.queue.popAvail(mem) catch |err| {
-            log.err("popAvail failed: {}", .{err});
-            break;
-        } orelse break;
+    switch (self.backend) {
+        .blk => |b| {
+            if (!self.queues[0].isReady()) return false;
+            var processed: u16 = 0;
+            while (processed < self.queues[0].size) : (processed += 1) {
+                const head = self.queues[0].popAvail(mem) catch |err| {
+                    log.err("popAvail failed: {}", .{err});
+                    break;
+                } orelse break;
 
-        self.blk.processRequest(mem, &self.queue, head) catch |err| {
-            log.err("block request failed: {}", .{err});
-            // Push a zero-length entry so the guest reclaims the descriptor
-            self.queue.pushUsed(mem, head, 0) catch {};
-        };
-        did_work = true;
+                b.processRequest(mem, &self.queues[0], head) catch |err| {
+                    log.err("block request failed: {}", .{err});
+                    self.queues[0].pushUsed(mem, head, 0) catch {};
+                };
+                did_work = true;
+            }
+        },
+        .net => |n| {
+            // Process TX queue (queue 1)
+            if (self.queues[Net.TX_QUEUE].isReady()) {
+                if (n.processTx(mem, &self.queues[Net.TX_QUEUE])) did_work = true;
+            }
+        },
     }
 
     if (did_work) {
         self.interrupt_status |= virtio.INT_USED_RING;
     }
     return did_work;
+}
+
+/// Poll for incoming RX data (net devices only).
+/// Returns true if frames were delivered (caller should inject IRQ).
+pub fn pollRx(self: *Self, mem: *Memory) bool {
+    if (self.status & virtio.STATUS_DRIVER_OK == 0) return false;
+    switch (self.backend) {
+        .net => |n| {
+            if (!self.queues[Net.RX_QUEUE].isReady()) return false;
+            if (n.pollRx(mem, &self.queues[Net.RX_QUEUE])) {
+                self.interrupt_status |= virtio.INT_USED_RING;
+                return true;
+            }
+        },
+        else => {},
+    }
+    return false;
 }
 
 /// Check if address falls within this device's MMIO range.
