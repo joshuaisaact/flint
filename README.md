@@ -18,12 +18,12 @@ flint-agent (inside VM) --> fork+exec --> user command
 
 ## Features
 
-- **Fast boot**: Linux 6.x to userspace in ~1 second via direct boot protocol (bzImage + initrd)
-- **Snapshot restore**: Save/restore full VM state for near-instant cold start (<50ms)
-- **VM pool**: Pre-warm pool of snapshot-restored VMs with acquire/release API
-- **Sandbox API**: Execute commands, upload/download files inside VMs via REST
+- **Fast boot**: Linux 6.x to userspace in ~650ms via direct boot protocol (bzImage + initrd)
+- **Snapshot restore**: Save/restore full VM state in ~10ms (demand-paged via MAP_PRIVATE mmap)
+- **VM pool**: Pre-warm pool of snapshot-restored VMs with acquire/release API and HTTP health checks
+- **Sandbox API**: Execute commands, upload/download files inside VMs via REST, graceful shutdown
 - **virtio devices**: virtio-blk (disk), virtio-net (TAP networking), virtio-vsock (host communication)
-- **Security**: KVM hardware isolation, seccomp BPF (44 syscall whitelist), mount namespaces, pivot_root, cgroups v2, privilege drop
+- **Security**: KVM hardware isolation, seccomp BPF (44 syscall whitelist with argument filtering), mount namespaces, pivot_root, cgroups v2, privilege drop, CPUID filtering
 - **Zero dependencies**: Pure Zig + Linux syscalls, no libc runtime in the guest agent
 
 ## Building
@@ -41,13 +41,13 @@ zig build test         # run unit tests (26 tests)
 
 ```bash
 # Direct boot with kernel + initrd
-flint --kernel bzImage --initrd initrd.cpio.gz
+flint bzImage initrd.cpio.gz
 
 # With disk and networking
-flint --kernel bzImage --initrd initrd.cpio.gz --disk rootfs.img --tap tap0
+flint bzImage initrd.cpio.gz --disk rootfs.img --tap tap0
 
 # With vsock for host<->guest communication
-flint --kernel bzImage --initrd initrd.cpio.gz --vsock-cid 3 --vsock-uds /tmp/flint-vsock
+flint bzImage initrd.cpio.gz --vsock-cid 3 --vsock-uds /tmp/flint-vsock
 ```
 
 ### Boot via REST API
@@ -111,6 +111,12 @@ curl -X POST --unix-socket /tmp/flint.sock http://localhost/sandbox/read \
 ```
 
 stdout/stderr in exec responses are base64-encoded.
+
+```bash
+# Graceful shutdown (sends poweroff to guest agent, waits up to 5s)
+curl -X PUT --unix-socket /tmp/flint.sock http://localhost/actions \
+  -d '{"action_type": "SendCtrlAltDel"}'
+```
 
 ## Architecture
 
