@@ -505,6 +505,8 @@ fn handlePostBootRequest(
         handleSnapshotCreate(request, body, allocator, runtime);
     } else if (method == .GET and std.mem.eql(u8, target, "/vm")) {
         handleVmGet(request, runtime);
+    } else if (method == .PUT and std.mem.eql(u8, target, "/actions")) {
+        handlePostBootAction(request, body, allocator, runtime);
     } else if (method == .POST and std.mem.eql(u8, target, "/sandbox/exec")) {
         handleSandboxExec(request, body, runtime);
     } else if (method == .POST and std.mem.eql(u8, target, "/sandbox/write")) {
@@ -662,6 +664,59 @@ fn handleVmGet(request: *http.Server.Request, runtime: *main_mod.VmRuntime) void
             .{ .name = "content-type", .value = "application/json" },
         },
     }) catch {};
+}
+
+/// Handle post-boot actions (e.g., graceful shutdown).
+fn handlePostBootAction(
+    request: *http.Server.Request,
+    body: ?[]const u8,
+    allocator: std.mem.Allocator,
+    runtime: *main_mod.VmRuntime,
+) void {
+    const data = body orelse {
+        respondError(request, .bad_request, "missing request body");
+        return;
+    };
+
+    const parsed = json.parseFromSlice(ActionBody, allocator, data, .{
+        .ignore_unknown_fields = true,
+    }) catch {
+        respondError(request, .bad_request, "invalid JSON");
+        return;
+    };
+    defer parsed.deinit();
+
+    if (std.mem.eql(u8, parsed.value.action_type, "SendCtrlAltDel")) {
+        const agent = getAgent(runtime) orelse {
+            respondError(request, .service_unavailable, "sandbox agent not connected");
+            return;
+        };
+
+        // Ask the guest to shut down gracefully via the agent
+        const cmd = "{\"method\":\"exec\",\"cmd\":\"poweroff -f 2>/dev/null || kill -SIGTERM 1\",\"timeout\":5}";
+        var resp_buf: [1024]u8 = undefined;
+        _ = agent.command(cmd, &resp_buf) catch {
+            respondError(request, .internal_server_error, "agent communication failed");
+            return;
+        };
+
+        // Wait for the VM to exit (up to 5 seconds)
+        const linux = std.os.linux;
+        var waited: u32 = 0;
+        while (waited < 50) : (waited += 1) {
+            if (runtime.exited.load(.acquire)) break;
+            const ts = linux.timespec{ .sec = 0, .nsec = 100_000_000 }; // 100ms
+            _ = linux.nanosleep(&ts, null);
+        }
+
+        if (runtime.exited.load(.acquire)) {
+            respondOk(request);
+        } else {
+            respondError(request, .internal_server_error, "VM did not exit within timeout");
+        }
+    } else {
+        respondError(request, .bad_request, "unknown action_type (post-boot supports: SendCtrlAltDel)");
+    }
 }
 
 // --- Sandbox API ---
