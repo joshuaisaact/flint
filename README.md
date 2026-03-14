@@ -18,7 +18,7 @@ flint-agent (inside VM) --> fork+exec --> user command
 
 ## Features
 
-- **Fast boot**: Linux 6.x to userspace in ~650ms via direct boot protocol (bzImage + initrd)
+- **Fast boot**: ~84ms to userspace with a minimal kernel (or ~650ms with a stock distro kernel)
 - **Snapshot restore**: Save/restore full VM state in ~10ms (demand-paged via MAP_PRIVATE mmap)
 - **VM pool**: Pre-warm pool of snapshot-restored VMs with acquire/release API and HTTP health checks
 - **Sandbox API**: Execute commands, upload/download files inside VMs via REST, graceful shutdown
