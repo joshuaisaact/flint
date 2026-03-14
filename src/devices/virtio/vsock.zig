@@ -50,6 +50,14 @@ const MAX_CONNECTIONS: usize = 64;
 // Maximum UDS path length
 const MAX_UDS_PATH: usize = 107; // sun_path max (108) minus null
 
+// Per-connection write buffer for backpressure handling.
+// When the host socket returns EAGAIN, unsent data is stashed here
+// and flushed on the next poll cycle. Without this, data was silently
+// dropped — the guest had no way to know the write failed.
+// 256 bytes per connection × 64 connections = 16KB total (fits on stack).
+// This only needs to buffer one partial write between poll cycles.
+const WRITE_BUF_SIZE: usize = 256;
+
 const Connection = struct {
     state: State = .idle,
     guest_port: u32 = 0,
@@ -62,6 +70,9 @@ const Connection = struct {
     tx_cnt: u32 = 0,
     // Flow control: our receive buffer tracking
     rx_cnt: u32 = 0,
+    // Write buffer for backpressure (data pending write to host socket)
+    write_buf: [WRITE_BUF_SIZE]u8 = undefined,
+    write_len: u32 = 0,
 
     const State = enum { idle, established, closing };
 
@@ -74,6 +85,47 @@ const Connection = struct {
         const in_flight = sent -% acked;
         if (in_flight >= window) return 0;
         return window - in_flight;
+    }
+
+    /// Try to flush the write buffer to the host socket.
+    /// Returns true if the buffer is now empty.
+    fn flushWriteBuffer(self: *Connection) bool {
+        if (self.write_len == 0) return true;
+        if (self.fd < 0) {
+            self.write_len = 0;
+            return true;
+        }
+        while (self.write_len > 0) {
+            const rc: isize = @bitCast(linux.write(self.fd, self.write_buf[0..self.write_len].ptr, self.write_len));
+            if (rc < 0) {
+                const errno: linux.E = @enumFromInt(@as(u16, @intCast(-rc)));
+                if (errno == .AGAIN) return false; // still blocked
+                // Real error — drop buffer, connection will be cleaned up
+                self.write_len = 0;
+                return true;
+            }
+            if (rc == 0) return false;
+            const written: u32 = @intCast(rc);
+            // Shift remaining data to front of buffer
+            if (written < self.write_len) {
+                const remaining = self.write_len - written;
+                std.mem.copyForwards(u8, self.write_buf[0..remaining], self.write_buf[written..self.write_len]);
+                self.write_len = remaining;
+            } else {
+                self.write_len = 0;
+            }
+        }
+        return true;
+    }
+
+    /// Stash data in the write buffer. Returns how many bytes were stashed.
+    fn stashWrite(self: *Connection, data: []const u8) u32 {
+        const space = WRITE_BUF_SIZE - self.write_len;
+        const to_copy = @min(data.len, space);
+        if (to_copy == 0) return 0;
+        @memcpy(self.write_buf[self.write_len..][0..to_copy], data[0..to_copy]);
+        self.write_len += @intCast(to_copy);
+        return @intCast(to_copy);
     }
 };
 
@@ -133,6 +185,16 @@ pub fn readConfig(self: Self, offset: u64, data: []u8) void {
         @memcpy(data, config[start..][0..data.len]);
     } else {
         @memset(data, 0);
+    }
+}
+
+/// Flush pending write buffers on all connections.
+/// Called from the run loop between KVM exits.
+pub fn flushPendingWrites(self: *Self) void {
+    for (&self.connections) |*conn| {
+        if (conn.state != .idle and conn.write_len > 0) {
+            _ = conn.flushWriteBuffer();
+        }
     }
 }
 
@@ -338,7 +400,22 @@ fn handleRw(self: *Self, mem: *Memory, descs: []const Queue.Desc, desc_count: us
 
     if (payload_len == 0 or conn.fd < 0) return;
 
-    // Collect payload from data descriptors (skip header descriptor)
+    // Flush any pending write buffer first
+    if (!conn.flushWriteBuffer()) {
+        // Still blocked — stash new data in write buffer
+        var remaining: u32 = payload_len;
+        for (descs[1..desc_count]) |desc| {
+            if (remaining == 0) break;
+            const chunk_len = @min(desc.len, remaining);
+            const buf = mem.slice(@intCast(desc.addr), chunk_len) catch return;
+            const stashed = conn.stashWrite(buf[0..chunk_len]);
+            conn.rx_cnt +%= stashed;
+            remaining -= chunk_len;
+        }
+        return;
+    }
+
+    // Write payload from data descriptors to host socket
     var remaining: u32 = payload_len;
     for (descs[1..desc_count]) |desc| {
         if (remaining == 0) break;
@@ -353,7 +430,23 @@ fn handleRw(self: *Self, mem: *Memory, descs: []const Queue.Desc, desc_count: us
             const rc: isize = @bitCast(linux.write(conn.fd, buf[written..].ptr, chunk_len - written));
             if (rc < 0) {
                 const errno: linux.E = @enumFromInt(@as(u16, @intCast(-rc)));
-                if (errno == .AGAIN) break;
+                if (errno == .AGAIN) {
+                    // Stash unwritten data in buffer instead of dropping it
+                    const unsent = buf[written..chunk_len];
+                    const stashed = conn.stashWrite(unsent);
+                    conn.rx_cnt +%= @intCast(written + stashed);
+                    // Stash remaining descriptors too
+                    remaining -= chunk_len;
+                    for (descs[1..desc_count]) |rem_desc| {
+                        if (remaining == 0) break;
+                        const rem_len = @min(rem_desc.len, remaining);
+                        const rem_buf = mem.slice(@intCast(rem_desc.addr), rem_len) catch break;
+                        const rem_stashed = conn.stashWrite(rem_buf[0..rem_len]);
+                        conn.rx_cnt +%= rem_stashed;
+                        remaining -= rem_len;
+                    }
+                    return;
+                }
                 log.warn("write to host socket failed: {}", .{errno});
                 return;
             }

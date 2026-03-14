@@ -830,6 +830,34 @@ fn runLoopThread(runtime: *VmRuntime) void {
 }
 
 fn runLoop(vcpu: *Vcpu, serial: *Serial, vm: *const Vm, mem: *Memory, devices: *DeviceArray, device_count: u32, snap_opts: SnapshotOpts, runtime: ?*VmRuntime) !void {
+    const linux = std.os.linux;
+
+    // Set up epoll for efficient device fd polling. Instead of blind-polling
+    // every device fd after each KVM exit, we use epoll_wait(timeout=0) to
+    // check which fds actually have data. Falls back to blind polling if
+    // epoll_create fails (shouldn't happen on Linux 2.6+).
+    const epoll_fd: i32 = blk: {
+        const rc: isize = @bitCast(linux.epoll_create1(linux.EPOLL.CLOEXEC));
+        if (rc < 0) break :blk -1;
+        break :blk @intCast(rc);
+    };
+    defer if (epoll_fd >= 0) abi.close(epoll_fd);
+
+    if (epoll_fd >= 0) {
+        for (0..device_count) |i| {
+            if (devices[i]) |dev| {
+                const poll_fd = dev.getPollFd();
+                if (poll_fd >= 0) {
+                    var ev = linux.epoll_event{
+                        .events = linux.EPOLL.IN,
+                        .data = .{ .u32 = @intCast(i) },
+                    };
+                    _ = linux.epoll_ctl(epoll_fd, linux.EPOLL.CTL_ADD, poll_fd, &ev);
+                }
+            }
+        }
+    }
+
     var exit_count: u64 = 0;
     while (true) {
         const exit_reason = vcpu.run() catch |err| {
@@ -857,11 +885,44 @@ fn runLoop(vcpu: *Vcpu, serial: *Serial, vm: *const Vm, mem: *Memory, devices: *
         };
         exit_count +%= 1;
 
-        // Poll RX on net devices between VM exits
+        // Flush pending vsock write buffers
         for (devices[0..device_count]) |*dev_opt| {
-            if (dev_opt.*) |*dev| {
-                if (dev.pollRx(mem)) {
-                    injectIrq(vm, dev.irq);
+            if (dev_opt.*) |*dev| dev.flushPendingWrites();
+        }
+
+        // Poll device fds for incoming data. Epoll checks which fds have
+        // data ready; vsock (dynamic connection fds) still uses blind polling.
+        if (epoll_fd >= 0) {
+            var events: [8]linux.epoll_event = undefined;
+            const nfds: isize = @bitCast(linux.epoll_wait(epoll_fd, &events, events.len, 0));
+            if (nfds > 0) {
+                for (events[0..@intCast(nfds)]) |ev| {
+                    const idx = ev.data.u32;
+                    if (idx < device_count) {
+                        if (devices[idx]) |*dev| {
+                            if (dev.pollRx(mem)) {
+                                injectIrq(vm, dev.irq);
+                            }
+                        }
+                    }
+                }
+            }
+            // Vsock connections have dynamic fds not in epoll — still poll them
+            for (devices[0..device_count]) |*dev_opt| {
+                if (dev_opt.*) |*dev| {
+                    if (dev.getPollFd() < 0) {
+                        if (dev.pollRx(mem)) {
+                            injectIrq(vm, dev.irq);
+                        }
+                    }
+                }
+            }
+        } else {
+            for (devices[0..device_count]) |*dev_opt| {
+                if (dev_opt.*) |*dev| {
+                    if (dev.pollRx(mem)) {
+                        injectIrq(vm, dev.irq);
+                    }
                 }
             }
         }

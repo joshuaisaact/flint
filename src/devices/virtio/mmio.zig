@@ -429,6 +429,24 @@ pub fn pollRx(self: *Self, mem: *Memory) bool {
     return false;
 }
 
+/// Flush pending write buffers (vsock only). No-op for other device types.
+pub fn flushPendingWrites(self: *Self) void {
+    switch (self.backend) {
+        .vsock => |*v| v.flushPendingWrites(),
+        else => {},
+    }
+}
+
+/// Return the pollable fd for this device (TAP fd for net, -1 for others).
+/// Used by the run loop to register device fds with epoll instead of
+/// blind-polling every device after each KVM exit.
+pub fn getPollFd(self: Self) i32 {
+    return switch (self.backend) {
+        .net => |n| n.tap_fd,
+        else => -1,
+    };
+}
+
 /// Check if address falls within this device's MMIO range.
 pub fn matchesAddr(self: Self, addr: u64) bool {
     return addr >= self.mmio_base and addr < self.mmio_base + virtio.MMIO_SIZE;
