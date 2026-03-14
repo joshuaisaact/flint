@@ -266,8 +266,11 @@ fn formatError(buf: []u8, msg: []const u8) []const u8 {
     return std.fmt.bufPrint(buf, "{{\"ok\":false,\"error\":\"{s}\"}}", .{msg}) catch "{}";
 }
 
-// Simple JSON field extraction (no allocator needed).
-// Handles escaped quotes in string values.
+// Hand-rolled JSON field extraction — intentionally avoids std.json which
+// requires an allocator. The agent uses only static buffers (zero allocation
+// after startup), and the protocol is flat JSON with no nesting, controlled
+// entirely by the host-side flint process. This only needs to handle string,
+// numeric, and boolean values at the top level.
 fn jsonStr(json: []const u8, key: []const u8) ?[]const u8 {
     var search_buf: [256]u8 = undefined;
     const search = std.fmt.bufPrint(&search_buf, "\"{s}\"", .{key}) catch return null;

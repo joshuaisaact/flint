@@ -356,6 +356,7 @@ fn createVmComponents(
     errdefer vcpu.deinit();
 
     var cpuid = try kvm.getSupportedCpuid();
+    normalizeCpuid(&cpuid);
     try vcpu.setCpuid(&cpuid);
     try setupRegisters(&vcpu, boot, &mem);
 
@@ -622,6 +623,44 @@ const EFER_NXE: u64 = 1 << 11; // No-Execute Enable
 const PTE_PRESENT: u64 = 1 << 0;
 const PTE_WRITABLE: u64 = 1 << 1;
 const PTE_HUGE: u64 = 1 << 7; // 1GB page in PDPT
+
+/// Filter CPUID entries to hide host features that the VMM doesn't support.
+/// Without this, the guest may try to use features (CET, SGX, etc.) that
+/// require VMM-side emulation we don't provide, causing crashes.
+/// This is the same class of filtering Firecracker does in its "CPUID
+/// normalization" pass, but limited to crash/security-relevant features
+/// rather than cosmetic ones (brand strings, topology, perf counters).
+fn normalizeCpuid(cpuid: *Kvm.CpuidBuffer) void {
+    for (cpuid.entries[0..cpuid.nent]) |*entry| {
+        switch (entry.function) {
+            0x1 => {
+                // ECX: hide features we don't emulate
+                entry.ecx &= ~@as(u32, 1 << 15); // PDCM (perf capabilities MSR)
+                // ECX.31: set HYPERVISOR bit so guest knows it's virtualized
+                entry.ecx |= 1 << 31;
+            },
+            0x7 => if (entry.index == 0) {
+                // Structured extended features — hide unsupported ones
+                // CET: we don't emulate CET MSRs or CR4.CET, so the guest
+                // must not try to enable IBT/SHSTK (causes #CP on reboot)
+                entry.ecx &= ~@as(u32, 1 << 7); // CET_SS (shadow stack)
+                entry.ecx &= ~@as(u32, 1 << 5); // WAITPKG (guest can stall physical CPU)
+                entry.edx &= ~@as(u32, 1 << 20); // CET_IBT (indirect branch tracking)
+                // SGX: we don't provide EPC memory
+                entry.ebx &= ~@as(u32, 1 << 2); // SGX
+                entry.ecx &= ~@as(u32, 1 << 30); // SGX_LC
+            },
+            0xa => {
+                // Performance monitoring: disable entirely (no PMU emulation)
+                entry.eax = 0;
+                entry.ebx = 0;
+                entry.ecx = 0;
+                entry.edx = 0;
+            },
+            else => {},
+        }
+    }
+}
 
 fn setupRegisters(vcpu: *Vcpu, boot: loader.LoadResult, mem: *Memory) !void {
     // Write a GDT with 64-bit code segment
