@@ -548,6 +548,11 @@ fn handleVmPatch(
             return;
         }
 
+        // Kick the vCPU thread out of a blocking KVM_RUN (e.g., guest in HLT).
+        // immediate_exit only takes effect on the *next* KVM_RUN call, so if
+        // the vCPU is already blocked we need a signal to force -EINTR.
+        runtime.kickVcpu();
+
         // Wait for the run loop to acknowledge it has left KVM_RUN
         while (!runtime.ack_paused.load(.acquire)) {
             if (runtime.exited.load(.acquire)) {

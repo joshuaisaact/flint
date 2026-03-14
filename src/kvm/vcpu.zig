@@ -64,8 +64,23 @@ pub fn setSregs(self: Self, sregs: *const c.kvm_sregs) !void {
 }
 
 /// Execute the vCPU until it exits. Returns the exit reason.
+/// Unlike the generic ioctl helper, this does NOT retry on EINTR —
+/// KVM_RUN returns EINTR when interrupted by a signal (e.g., for
+/// pause), and the caller needs to see that.
 pub fn run(self: Self) !u32 {
-    try abi.ioctlVoid(self.fd, c.KVM_RUN, 0);
+    const linux = std.os.linux;
+    const rc = linux.syscall3(.ioctl, @bitCast(@as(isize, self.fd)), c.KVM_RUN, 0);
+    const signed: isize = @bitCast(rc);
+    if (signed < 0) {
+        const errno: linux.E = @enumFromInt(@as(u16, @intCast(-signed)));
+        return switch (errno) {
+            .INTR => error.Interrupted,
+            .AGAIN => error.Again,
+            .BADF => error.BadFd,
+            .INVAL => error.InvalidArgument,
+            else => error.Unexpected,
+        };
+    }
     return self.kvm_run.exit_reason;
 }
 

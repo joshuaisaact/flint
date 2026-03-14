@@ -39,7 +39,8 @@ pub const VmRuntime = struct {
     snap_opts: SnapshotOpts,
     agent: ?*sandbox.AgentConn = null,
 
-    // Pause mechanism: API thread sets paused=true and immediate_exit=1.
+    // Pause mechanism: API thread sets paused=true and immediate_exit=1,
+    // then sends SIGUSR1 to the vCPU thread to kick it out of KVM_RUN.
     // KVM_RUN returns -EINTR, run loop sees paused=true and spins on
     // the flag. API thread does its work, then sets paused=false.
     paused: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -50,6 +51,20 @@ pub const VmRuntime = struct {
     // Set by the run loop when the guest exits (halt/shutdown/error).
     // Tells the API thread to stop accepting connections.
     exited: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    // TID of the vCPU thread, used to send SIGUSR1 to kick it out of
+    // a blocking KVM_RUN (e.g., when the guest is in HLT).
+    vcpu_tid: std.atomic.Value(i32) = std.atomic.Value(i32).init(0),
+
+    /// Send SIGUSR1 to the vCPU thread to break it out of KVM_RUN.
+    /// This is needed because immediate_exit only takes effect on the
+    /// *next* KVM_RUN call — if the vCPU is already blocked (e.g., guest
+    /// executed HLT), we need a signal to force -EINTR.
+    pub fn kickVcpu(self: *VmRuntime) void {
+        const tid = self.vcpu_tid.load(.acquire);
+        if (tid != 0) {
+            _ = std.os.linux.tkill(tid, std.os.linux.SIG.USR1);
+        }
+    }
 };
 
 const DEFAULT_MEM_SIZE = 512 * 1024 * 1024; // 512 MB
@@ -737,8 +752,29 @@ fn initDevices(
     return device_count;
 }
 
+/// No-op signal handler for SIGUSR1. The signal's only purpose is to
+/// interrupt KVM_RUN with -EINTR so the run loop can check the pause flag.
+fn sigusr1Handler(_: std.os.linux.SIG) callconv(.c) void {}
+
+/// Install a no-op SIGUSR1 handler so the signal interrupts KVM_RUN
+/// without killing the process (default disposition for SIGUSR1 is Term).
+fn installKickSignal() void {
+    const linux = std.os.linux;
+    var sa: linux.Sigaction = .{
+        .handler = .{ .handler = &sigusr1Handler },
+        .mask = linux.sigemptyset(),
+        .flags = linux.SA.RESTART, // don't break other syscalls
+    };
+    _ = linux.sigaction(linux.SIG.USR1, &sa, null);
+}
+
 /// Thread entry point for run loop when running alongside the API server.
 fn runLoopThread(runtime: *VmRuntime) void {
+    installKickSignal();
+    // Store our TID so the API thread can send us SIGUSR1
+    const tid: i32 = @intCast(std.os.linux.gettid());
+    runtime.vcpu_tid.store(tid, .release);
+
     runLoop(
         runtime.vcpu,
         runtime.serial,
@@ -758,21 +794,24 @@ fn runLoop(vcpu: *Vcpu, serial: *Serial, vm: *const Vm, mem: *Memory, devices: *
     var exit_count: u64 = 0;
     while (true) {
         const exit_reason = vcpu.run() catch |err| {
-            // immediate_exit causes KVM_RUN to return -EINTR (VmRunFailed).
-            // Check if this was a pause request from the API thread.
-            if (runtime) |rt| {
-                if (rt.paused.load(.acquire)) {
-                    rt.ack_paused.store(true, .release);
-                    log.info("vCPU paused by API request", .{});
-                    // Spin until unpaused — the API resume handler clears
-                    // ack_paused then paused, so we just watch paused here
-                    while (rt.paused.load(.acquire)) {
-                        std.atomic.spinLoopHint();
+            // KVM_RUN returns EINTR when interrupted by a signal. This happens
+            // when: (a) immediate_exit was set, or (b) SIGUSR1 kicked us out
+            // of a blocking HLT. Check if this was a pause request.
+            if (err == error.Interrupted) {
+                if (runtime) |rt| {
+                    if (rt.paused.load(.acquire)) {
+                        rt.ack_paused.store(true, .release);
+                        log.info("vCPU paused by API request", .{});
+                        while (rt.paused.load(.acquire)) {
+                            std.atomic.spinLoopHint();
+                        }
+                        log.info("vCPU resumed", .{});
+                        vcpu.kvm_run.immediate_exit = 0;
+                        continue;
                     }
-                    log.info("vCPU resumed", .{});
-                    vcpu.kvm_run.immediate_exit = 0;
-                    continue;
                 }
+                // Spurious signal — just re-enter KVM_RUN
+                continue;
             }
             log.err("KVM_RUN failed: {}", .{err});
             return err;
