@@ -271,22 +271,22 @@ pub const Pool = struct {
         log.info("spawned slot {} (pid {})", .{ id, slot.pid });
     }
 
-    /// Try to connect to a slot's API socket. Returns true if responsive.
+    /// Verify a slot's VM is actually responsive by sending GET /vm to its
+    /// API socket and checking for an HTTP 200 response. This is strictly
+    /// better than a TCP connect probe — a crashed VM that bound the socket
+    /// before dying would pass a connect check but fail here.
     fn probeSocket(slot: *const VmSlot) bool {
         const path = slot.sockPath();
         if (path.len == 0) return false;
 
-        // Try to connect via raw socket syscall
         const sock_rc: isize = @bitCast(linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0));
         if (sock_rc < 0) return false;
         const fd: linux.fd_t = @intCast(sock_rc);
         defer _ = linux.close(fd);
 
-        // Build sockaddr_un
         var addr: linux.sockaddr.un = .{ .family = linux.AF.UNIX, .path = undefined };
         @memset(&addr.path, 0);
         if (path.len > addr.path.len) return false;
-        // Copy path bytes into the fixed-size array
         for (0..path.len) |j| {
             addr.path[j] = @intCast(path[j]);
         }
@@ -298,7 +298,22 @@ pub const Pool = struct {
         ));
         if (connect_rc < 0) return false;
 
-        // Socket accepts connections — VM is ready
-        return true;
+        // Send a minimal HTTP request to verify the API is responsive
+        const req = "GET /vm HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+        var written: usize = 0;
+        while (written < req.len) {
+            const rc: isize = @bitCast(linux.write(fd, req[written..].ptr, req.len - written));
+            if (rc <= 0) return false;
+            written += @intCast(rc);
+        }
+
+        // Read enough of the response to check for "200"
+        var buf: [64]u8 = undefined;
+        const read_rc: isize = @bitCast(linux.read(fd, &buf, buf.len));
+        if (read_rc < 12) return false; // "HTTP/1.1 200" is 12 chars minimum
+        const resp = buf[0..@intCast(read_rc)];
+
+        return std.mem.startsWith(u8, resp, "HTTP/1.1 200") or
+            std.mem.startsWith(u8, resp, "HTTP/1.0 200");
     }
 };
