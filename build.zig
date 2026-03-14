@@ -50,4 +50,23 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_tests.step);
+
+    // Integration tests: spawn flint binary and test end-to-end behavior.
+    // Requires /dev/kvm and a kernel at /tmp/vmlinuz-minimal.
+    // Run with: zig build integration-test
+    const integration_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/integration_tests.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    integration_tests.root_module.link_libc = true;
+
+    const run_integration = b.addRunArtifact(integration_tests);
+    // Integration tests depend on the flint binary being built
+    run_integration.step.dependOn(b.getInstallStep());
+
+    const integration_step = b.step("integration-test", "Run integration tests (requires /dev/kvm + kernel)");
+    integration_step.dependOn(&run_integration.step);
 }
