@@ -55,117 +55,74 @@ pub const VmRuntime = struct {
 const DEFAULT_MEM_SIZE = 512 * 1024 * 1024; // 512 MB
 const DEFAULT_CMDLINE = "earlyprintk=serial,ttyS0,115200 console=ttyS0 nokaslr reboot=k panic=1 pci=off nomodules";
 
+/// CLI arguments parsed from the command line.
+/// Flag names are derived from field names: underscores become hyphens,
+/// and each field maps to `--field-name`. Bool fields are flags (no value),
+/// optional/non-optional sentinel pointer fields consume the next argument.
+const CliArgs = struct {
+    // Boot sources (positional args handled separately)
+    @"api-sock": ?[*:0]const u8 = null,
+    disk: ?[*:0]const u8 = null,
+    tap: ?[*:0]const u8 = null,
+    @"vsock-cid": ?[*:0]const u8 = null,
+    @"vsock-uds": ?[*:0]const u8 = null,
+
+    // Snapshot
+    restore: bool = false,
+    @"save-on-halt": bool = false,
+    @"vmstate-path": [*:0]const u8 = "snapshot.vmstate",
+    @"mem-path": [*:0]const u8 = "snapshot.mem",
+
+    // Jail / security
+    jail: ?[*:0]const u8 = null,
+    @"jail-uid": ?[*:0]const u8 = null,
+    @"jail-gid": ?[*:0]const u8 = null,
+    @"jail-cgroup": ?[*:0]const u8 = null,
+    @"seccomp-audit": bool = false,
+
+    // Pool
+    @"pool-size": ?[*:0]const u8 = null,
+    @"pool-sock": [*:0]const u8 = "/tmp/flint-pool.sock",
+
+    /// Try to match `flag` against all struct fields (as `--field-name`).
+    /// For bool fields, sets to true. For pointer fields, consumes the next arg.
+    /// Returns true if the flag was recognized.
+    fn parse(self: *CliArgs, flag: []const u8, iter: *std.process.Args.Iterator) bool {
+        inline for (std.meta.fields(CliArgs)) |field| {
+            if (std.mem.eql(u8, flag, "--" ++ field.name)) {
+                if (field.type == bool) {
+                    @field(self, field.name) = true;
+                } else {
+                    @field(self, field.name) = iter.next() orelse {
+                        std.debug.print("--" ++ field.name ++ " requires an argument\n", .{});
+                        std.process.exit(1);
+                    };
+                }
+                return true;
+            }
+        }
+        return false;
+    }
+};
+
 pub fn main(init: std.process.Init) !void {
     var args = std.process.Args.Iterator.init(init.minimal.args);
     const self_exe = args.next() orelse "flint";
 
+    var cli: CliArgs = .{};
     var pool_mode = false;
-    var pool_size: u16 = 4;
-    var pool_sock: [*:0]const u8 = "/tmp/flint-pool.sock";
-    var api_sock: ?[*:0]const u8 = null;
     var kernel_path: ?[*:0]const u8 = null;
     var initrd_path: ?[*:0]const u8 = null;
-    var disk_path: ?[*:0]const u8 = null;
-    var tap_name: ?[*:0]const u8 = null;
-    var vsock_cid: ?[*:0]const u8 = null;
-    var vsock_uds: ?[*:0]const u8 = null;
-    var restore_mode = false;
-    var save_on_halt = false;
-    var vmstate_path: [*:0]const u8 = "snapshot.vmstate";
-    var mem_snap_path: [*:0]const u8 = "snapshot.mem";
-    var jail_dir: ?[*:0]const u8 = null;
-    var jail_uid: ?[*:0]const u8 = null;
-    var jail_gid: ?[*:0]const u8 = null;
-    var jail_cgroup: ?[*:0]const u8 = null;
-    var seccomp_audit = false;
     var cmdline: [*:0]const u8 = DEFAULT_CMDLINE;
     var got_initrd = false;
 
     while (args.next()) |arg| {
         const len = std.mem.indexOfSentinel(u8, 0, arg);
         const s = arg[0..len];
-        if (std.mem.eql(u8, s, "--api-sock")) {
-            api_sock = args.next() orelse {
-                std.debug.print("--api-sock requires an argument\n", .{});
-                std.process.exit(1);
-            };
-        } else if (std.mem.eql(u8, s, "--disk")) {
-            disk_path = args.next() orelse {
-                std.debug.print("--disk requires an argument\n", .{});
-                std.process.exit(1);
-            };
-        } else if (std.mem.eql(u8, s, "--tap")) {
-            tap_name = args.next() orelse {
-                std.debug.print("--tap requires an argument\n", .{});
-                std.process.exit(1);
-            };
-        } else if (std.mem.eql(u8, s, "--vsock-cid")) {
-            vsock_cid = args.next() orelse {
-                std.debug.print("--vsock-cid requires an argument\n", .{});
-                std.process.exit(1);
-            };
-        } else if (std.mem.eql(u8, s, "--vsock-uds")) {
-            vsock_uds = args.next() orelse {
-                std.debug.print("--vsock-uds requires an argument\n", .{});
-                std.process.exit(1);
-            };
-        } else if (std.mem.eql(u8, s, "--restore")) {
-            restore_mode = true;
-        } else if (std.mem.eql(u8, s, "--save-on-halt")) {
-            save_on_halt = true;
-        } else if (std.mem.eql(u8, s, "--vmstate-path")) {
-            vmstate_path = args.next() orelse {
-                std.debug.print("--vmstate-path requires an argument\n", .{});
-                std.process.exit(1);
-            };
-        } else if (std.mem.eql(u8, s, "--mem-path")) {
-            mem_snap_path = args.next() orelse {
-                std.debug.print("--mem-path requires an argument\n", .{});
-                std.process.exit(1);
-            };
-        } else if (std.mem.eql(u8, s, "--jail")) {
-            jail_dir = args.next() orelse {
-                std.debug.print("--jail requires an argument\n", .{});
-                std.process.exit(1);
-            };
-        } else if (std.mem.eql(u8, s, "--jail-uid")) {
-            jail_uid = args.next() orelse {
-                std.debug.print("--jail-uid requires an argument\n", .{});
-                std.process.exit(1);
-            };
-        } else if (std.mem.eql(u8, s, "--jail-gid")) {
-            jail_gid = args.next() orelse {
-                std.debug.print("--jail-gid requires an argument\n", .{});
-                std.process.exit(1);
-            };
-        } else if (std.mem.eql(u8, s, "--jail-cgroup")) {
-            jail_cgroup = args.next() orelse {
-                std.debug.print("--jail-cgroup requires an argument\n", .{});
-                std.process.exit(1);
-            };
-        } else if (std.mem.eql(u8, s, "--seccomp-audit")) {
-            seccomp_audit = true;
+        if (cli.parse(s, &args)) {
+            // handled by struct parser
         } else if (std.mem.eql(u8, s, "pool")) {
             pool_mode = true;
-        } else if (std.mem.eql(u8, s, "--pool-size")) {
-            const ps = args.next() orelse {
-                std.debug.print("--pool-size requires an argument\n", .{});
-                std.process.exit(1);
-            };
-            const ps_len = std.mem.indexOfSentinel(u8, 0, ps);
-            pool_size = std.fmt.parseUnsigned(u16, ps[0..ps_len], 10) catch {
-                std.debug.print("invalid --pool-size\n", .{});
-                std.process.exit(1);
-            };
-            if (pool_size == 0 or pool_size > pool_mod.MAX_POOL_SIZE) {
-                std.debug.print("--pool-size must be 1-{}\n", .{pool_mod.MAX_POOL_SIZE});
-                std.process.exit(1);
-            }
-        } else if (std.mem.eql(u8, s, "--pool-sock")) {
-            pool_sock = args.next() orelse {
-                std.debug.print("--pool-sock requires an argument\n", .{});
-                std.process.exit(1);
-            };
         } else if (std.mem.indexOfScalar(u8, s, '=') != null) {
             cmdline = arg;
         } else if (kernel_path == null) {
@@ -176,18 +133,32 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    // Validate --pool-size
+    var pool_size: u16 = 4;
+    if (cli.@"pool-size") |ps| {
+        const ps_len = std.mem.indexOfSentinel(u8, 0, ps);
+        pool_size = std.fmt.parseUnsigned(u16, ps[0..ps_len], 10) catch {
+            std.debug.print("invalid --pool-size\n", .{});
+            std.process.exit(1);
+        };
+        if (pool_size == 0 or pool_size > pool_mod.MAX_POOL_SIZE) {
+            std.debug.print("--pool-size must be 1-{}\n", .{pool_mod.MAX_POOL_SIZE});
+            std.process.exit(1);
+        }
+    }
+
     // Pool mode: manager process spawns child VMs, no jail/seccomp for itself
     if (pool_mode) {
         var pool = pool_mod.Pool.init(.{
             .pool_size = pool_size,
-            .vmstate_path = vmstate_path,
-            .mem_path = mem_snap_path,
-            .disk_path = disk_path,
-            .pool_sock = pool_sock,
+            .vmstate_path = cli.@"vmstate-path",
+            .mem_path = cli.@"mem-path",
+            .disk_path = cli.disk,
+            .pool_sock = cli.@"pool-sock",
             .self_exe = self_exe,
-            .jail_dir = jail_dir,
-            .jail_uid = jail_uid,
-            .jail_gid = jail_gid,
+            .jail_dir = cli.jail,
+            .jail_uid = cli.@"jail-uid",
+            .jail_gid = cli.@"jail-gid",
         });
         defer pool.shutdown();
         return pool_api.serve(&pool, init.io);
@@ -196,12 +167,12 @@ pub fn main(init: std.process.Init) !void {
     // Jail setup runs before anything else — after this, the process is
     // in a mount namespace with pivot_root'd filesystem and dropped privileges.
     // All file paths (kernel, initrd, disk) must be relative to the jail root.
-    if (jail_dir) |jd| {
-        const uid_str = jail_uid orelse {
+    if (cli.jail) |jd| {
+        const uid_str = cli.@"jail-uid" orelse {
             std.debug.print("--jail requires --jail-uid\n", .{});
             std.process.exit(1);
         };
-        const gid_str = jail_gid orelse {
+        const gid_str = cli.@"jail-gid" orelse {
             std.debug.print("--jail requires --jail-gid\n", .{});
             std.process.exit(1);
         };
@@ -223,27 +194,27 @@ pub fn main(init: std.process.Init) !void {
             .jail_dir = jd,
             .uid = uid,
             .gid = gid,
-            .cgroup = jail_cgroup,
-            .need_tun = tap_name != null,
+            .cgroup = cli.@"jail-cgroup",
+            .need_tun = cli.tap != null,
         });
     }
 
     // Seccomp filter — installed after jail (jail needs mount/mknod/setuid)
     // but before any guest interaction
-    if (jail_dir != null or seccomp_audit) {
-        try seccomp.install(seccomp_audit);
+    if (cli.jail != null or cli.@"seccomp-audit") {
+        try seccomp.install(cli.@"seccomp-audit");
     }
 
-    if (restore_mode and api_sock != null) {
+    if (cli.restore and cli.@"api-sock" != null) {
         // Restore + API mode: restore from snapshot, then run post-boot API
         // (used by pool manager to spawn controllable child VMs)
-        const sock = api_sock.?;
+        const sock = cli.@"api-sock".?;
         const sock_len = std.mem.indexOfSentinel(u8, 0, sock);
-        try restoreVmWithApi(vmstate_path, mem_snap_path, disk_path, tap_name, vsock_cid, vsock_uds, sock[0..sock_len], init.io, init.gpa);
-    } else if (restore_mode) {
+        try restoreVmWithApi(cli.@"vmstate-path", cli.@"mem-path", cli.disk, cli.tap, cli.@"vsock-cid", cli.@"vsock-uds", sock[0..sock_len], init.io, init.gpa);
+    } else if (cli.restore) {
         // Restore mode: rebuild VM from snapshot files, no kernel load
-        try restoreVm(vmstate_path, mem_snap_path, disk_path, tap_name, vsock_cid, vsock_uds);
-    } else if (api_sock) |sock| {
+        try restoreVm(cli.@"vmstate-path", cli.@"mem-path", cli.disk, cli.tap, cli.@"vsock-cid", cli.@"vsock-uds");
+    } else if (cli.@"api-sock") |sock| {
         // API mode: pre-boot config phase, then boot, then post-boot API
         const sock_len = std.mem.indexOfSentinel(u8, 0, sock);
         const config = try api.serve(sock[0..sock_len], init.io, init.gpa);
@@ -257,11 +228,11 @@ pub fn main(init: std.process.Init) !void {
         try bootVmWithApi(kp, ip, ba, dp, tn, vc, vu, config.mem_size_mib, sock[0..sock_len], init.io, init.gpa);
     } else if (kernel_path) |kp| {
         // CLI mode: boot directly from args
-        const snap_opts: SnapshotOpts = if (save_on_halt) .{
-            .vmstate_path = vmstate_path,
-            .mem_path = mem_snap_path,
+        const snap_opts: SnapshotOpts = if (cli.@"save-on-halt") .{
+            .vmstate_path = cli.@"vmstate-path",
+            .mem_path = cli.@"mem-path",
         } else .{};
-        try bootVm(kp, initrd_path, cmdline, disk_path, tap_name, vsock_cid, vsock_uds, DEFAULT_MEM_SIZE / (1024 * 1024), snap_opts);
+        try bootVm(kp, initrd_path, cmdline, cli.disk, cli.tap, cli.@"vsock-cid", cli.@"vsock-uds", DEFAULT_MEM_SIZE / (1024 * 1024), snap_opts);
     } else {
         std.debug.print("usage: flint <kernel> [initrd] [--disk <path>] [--tap <name>] [cmdline]\n", .{});
         std.debug.print("       flint --restore [--vmstate-path <path>] [--mem-path <path>]\n", .{});
