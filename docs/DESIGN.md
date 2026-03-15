@@ -195,7 +195,8 @@ Priority order optimized for AI agent code execution sandbox use case:
 
 4. ~~**Seccomp + jailer**~~ -- DONE. In-process `--jail` flag: mount namespace +
    pivot_root for filesystem isolation, device node creation (/dev/kvm, /dev/net/tun),
-   cgroups v2 for resource limits, privilege drop (setuid/setgid), seccomp BPF filter
+   cgroups v2 with enforced resource limits (`--jail-cpu` percentage, `--jail-memory`
+   MiB — writes cpu.max and memory.max), privilege drop (setuid/setgid), seccomp BPF filter
    (44 whitelisted syscalls, KILL_PROCESS default). `--seccomp-audit` mode for
    development (LOG instead of KILL). All file paths relative to jail root after
    pivot_root.

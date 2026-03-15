@@ -93,6 +93,8 @@ const CliArgs = struct {
     @"jail-uid": ?[*:0]const u8 = null,
     @"jail-gid": ?[*:0]const u8 = null,
     @"jail-cgroup": ?[*:0]const u8 = null,
+    @"jail-cpu": ?[*:0]const u8 = null,
+    @"jail-memory": ?[*:0]const u8 = null,
     @"seccomp-audit": bool = false,
 
     // Pool
@@ -178,6 +180,9 @@ pub fn main(init: std.process.Init) !void {
             .jail_dir = cli.jail,
             .jail_uid = cli.@"jail-uid",
             .jail_gid = cli.@"jail-gid",
+            .jail_cgroup = cli.@"jail-cgroup",
+            .jail_cpu = cli.@"jail-cpu",
+            .jail_memory = cli.@"jail-memory",
         });
         defer pool.shutdown();
         return pool_api.serve(&pool);
@@ -209,11 +214,29 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("--jail-uid and --jail-gid must be non-zero (jail must drop root)\n", .{});
             std.process.exit(1);
         }
+        var cpu_pct: u32 = 0;
+        if (cli.@"jail-cpu") |s| {
+            const l = std.mem.indexOfSentinel(u8, 0, s);
+            cpu_pct = std.fmt.parseUnsigned(u32, s[0..l], 10) catch {
+                std.debug.print("invalid --jail-cpu\n", .{});
+                std.process.exit(1);
+            };
+        }
+        var memory_mib: u32 = 0;
+        if (cli.@"jail-memory") |s| {
+            const l = std.mem.indexOfSentinel(u8, 0, s);
+            memory_mib = std.fmt.parseUnsigned(u32, s[0..l], 10) catch {
+                std.debug.print("invalid --jail-memory\n", .{});
+                std.process.exit(1);
+            };
+        }
         try jail.setup(.{
             .jail_dir = jd,
             .uid = uid,
             .gid = gid,
             .cgroup = cli.@"jail-cgroup",
+            .cpu_pct = cpu_pct,
+            .memory_mib = memory_mib,
             .need_tun = cli.tap != null,
         });
     }
@@ -256,7 +279,7 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("usage: flint <kernel> [initrd] [--disk <path>] [--tap <name>] [cmdline]\n", .{});
         std.debug.print("       flint --restore [--vmstate-path <path>] [--mem-path <path>]\n", .{});
         std.debug.print("       flint --api-sock <path>\n", .{});
-        std.debug.print("       --jail <dir> --jail-uid <uid> --jail-gid <gid> [--jail-cgroup <name>]\n", .{});
+        std.debug.print("       --jail <dir> --jail-uid <uid> --jail-gid <gid> [--jail-cgroup <name>] [--jail-cpu <pct>] [--jail-memory <MiB>]\n", .{});
         std.debug.print("       --seccomp-audit  (log violations instead of killing)\n", .{});
         std.debug.print("       flint pool --vmstate-path <p> --mem-path <p> --pool-size <n> --pool-sock <p>\n", .{});
         std.process.exit(1);

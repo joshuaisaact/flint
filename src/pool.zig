@@ -56,6 +56,9 @@ pub const Config = struct {
     jail_dir: ?[*:0]const u8 = null,
     jail_uid: ?[*:0]const u8 = null,
     jail_gid: ?[*:0]const u8 = null,
+    jail_cgroup: ?[*:0]const u8 = null,
+    jail_cpu: ?[*:0]const u8 = null,
+    jail_memory: ?[*:0]const u8 = null,
     pool_sock: [*:0]const u8,
     self_exe: [*:0]const u8, // argv[0] for re-exec
 };
@@ -328,6 +331,24 @@ pub const Pool = struct {
                 argv_buf[argc] = "--jail-gid";
                 argc += 1;
                 argv_buf[argc] = g;
+                argc += 1;
+            }
+            if (self.config.jail_cgroup) |cg| {
+                argv_buf[argc] = "--jail-cgroup";
+                argc += 1;
+                argv_buf[argc] = cg;
+                argc += 1;
+            }
+            if (self.config.jail_cpu) |cpu| {
+                argv_buf[argc] = "--jail-cpu";
+                argc += 1;
+                argv_buf[argc] = cpu;
+                argc += 1;
+            }
+            if (self.config.jail_memory) |mem| {
+                argv_buf[argc] = "--jail-memory";
+                argc += 1;
+                argv_buf[argc] = mem;
                 argc += 1;
             }
         }
