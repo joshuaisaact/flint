@@ -20,7 +20,7 @@ flint-agent (inside VM) --> fork+exec --> user command
 
 - **Fast boot**: ~84ms to userspace with a minimal kernel (or ~650ms with a stock distro kernel)
 - **Snapshot restore**: Save/restore full VM state in ~10ms (demand-paged via MAP_PRIVATE mmap)
-- **VM pool**: Pre-warm pool of snapshot-restored VMs with acquire/release API, per-VM disk CoW isolation (FICLONE on btrfs/XFS, read/write fallback), and HTTP health checks
+- **VM pool**: Pre-warm pool of snapshot-restored VMs with acquire/release API, per-VM disk CoW isolation, configurable guest readiness probes, VM lifetime timeouts, and automatic slot recycling
 - **Sandbox API**: Execute commands, upload/download files inside VMs via REST, graceful shutdown
 - **Epoll-based I/O**: Device fd polling via epoll instead of blind polling, vsock write backpressure buffering
 - **virtio devices**: virtio-blk (disk), virtio-net (TAP networking), virtio-vsock (host communication)
@@ -83,6 +83,8 @@ flint --restore --vmstate-path snap.vmstate --mem-path snap.mem --api-sock /tmp/
 ```bash
 # Start a pool of 4 pre-restored VMs (with per-VM disk isolation)
 flint pool --vmstate-path snap.vmstate --mem-path snap.mem --disk rootfs.img \
+  --vsock-cid 3 --vsock-uds /tmp/flint-vsock \
+  --ready-cmd 'curl -sf localhost:3000/health' \
   --pool-size 4 --pool-sock /tmp/pool.sock
 
 # Acquire a VM, use it, release it

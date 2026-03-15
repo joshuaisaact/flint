@@ -50,6 +50,9 @@ pub const Config = struct {
     vmstate_path: [*:0]const u8,
     mem_path: [*:0]const u8,
     disk_path: ?[*:0]const u8 = null,
+    vsock_cid: ?[*:0]const u8 = null,
+    vsock_uds: ?[*:0]const u8 = null,
+    ready_cmd: ?[*:0]const u8 = null,
     jail_dir: ?[*:0]const u8 = null,
     jail_uid: ?[*:0]const u8 = null,
     jail_gid: ?[*:0]const u8 = null,
@@ -149,14 +152,17 @@ pub const Pool = struct {
         }
     }
 
-    /// Check STARTING slots by connecting to their API socket.
+    /// Check STARTING slots: first verify the VMM API is responsive,
+    /// then optionally run a guest readiness command via sandbox/exec.
     pub fn healthCheck(self: *Pool) void {
         for (0..self.config.pool_size) |i| {
             if (self.slots[i].state == .starting) {
-                if (probeSocket(&self.slots[i])) {
-                    self.slots[i].state = .ready;
-                    log.info("slot {} ready (pid {})", .{ i, self.slots[i].pid });
+                if (!probeSocket(&self.slots[i])) continue;
+                if (self.config.ready_cmd) |cmd| {
+                    if (!probeReady(&self.slots[i], cmd)) continue;
                 }
+                self.slots[i].state = .ready;
+                log.info("slot {} ready (pid {})", .{ i, self.slots[i].pid });
             }
         }
     }
@@ -287,6 +293,26 @@ pub const Pool = struct {
             argc += 1;
         }
 
+        if (self.config.vsock_cid) |cid| {
+            if (self.config.vsock_uds) |uds| {
+                argv_buf[argc] = "--vsock-cid";
+                argc += 1;
+                argv_buf[argc] = cid;
+                argc += 1;
+                argv_buf[argc] = "--vsock-uds";
+                argc += 1;
+                // Per-VM vsock UDS path to avoid collisions between children
+                const uds_len = std.mem.indexOfSentinel(u8, 0, uds);
+                const vm_uds = std.fmt.bufPrint(&arg_strs[2], "{s}-vm-{}", .{ uds[0..uds_len], id }) catch {
+                    slot.state = .failed;
+                    return;
+                };
+                arg_strs[2][vm_uds.len] = 0;
+                argv_buf[argc] = @ptrCast(arg_strs[2][0..vm_uds.len :0]);
+                argc += 1;
+            }
+        }
+
         if (self.config.jail_dir) |jd| {
             argv_buf[argc] = "--jail";
             argc += 1;
@@ -374,6 +400,77 @@ pub const Pool = struct {
                 written += @intCast(wrc);
             }
         }
+    }
+
+    /// Run a readiness command inside the guest via POST /sandbox/exec.
+    /// Returns true only if the command exits with code 0.
+    fn probeReady(slot: *const VmSlot, ready_cmd: [*:0]const u8) bool {
+        const path = slot.sockPath();
+        if (path.len == 0) return false;
+
+        const sock_rc: isize = @bitCast(linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0));
+        if (sock_rc < 0) return false;
+        const fd: linux.fd_t = @intCast(sock_rc);
+        defer _ = linux.close(fd);
+
+        var addr: linux.sockaddr.un = .{ .family = linux.AF.UNIX, .path = undefined };
+        @memset(&addr.path, 0);
+        if (path.len > addr.path.len) return false;
+        for (0..path.len) |j| {
+            addr.path[j] = @intCast(path[j]);
+        }
+
+        const connect_rc: isize = @bitCast(linux.connect(
+            fd,
+            @ptrCast(&addr),
+            @intCast(@sizeOf(linux.sockaddr.un)),
+        ));
+        if (connect_rc < 0) return false;
+
+        // Build POST /sandbox/exec request
+        const cmd_len = std.mem.indexOfSentinel(u8, 0, ready_cmd);
+        var body_buf: [512]u8 = undefined;
+        const body = std.fmt.bufPrint(&body_buf, "{{\"cmd\":\"{s}\",\"timeout\":5}}", .{
+            ready_cmd[0..cmd_len],
+        }) catch return false;
+
+        var req_buf: [1024]u8 = undefined;
+        const req = std.fmt.bufPrint(&req_buf,
+            "POST /sandbox/exec HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{s}",
+            .{ body.len, body },
+        ) catch return false;
+
+        var written: usize = 0;
+        while (written < req.len) {
+            const rc: isize = @bitCast(linux.write(fd, req[written..].ptr, req.len - written));
+            if (rc <= 0) return false;
+            written += @intCast(rc);
+        }
+
+        // Wait for response with 10s timeout (ready_cmd has 5s guest timeout)
+        var pfd = linux.pollfd{ .fd = fd, .events = linux.POLL.IN, .revents = 0 };
+        const poll_rc: isize = @bitCast(linux.poll(@ptrCast(&pfd), 1, 10_000));
+        if (poll_rc <= 0) return false;
+
+        // Read until EOF (server sends Connection: close)
+        var resp_buf: [4096]u8 = undefined;
+        var total: usize = 0;
+        while (total < resp_buf.len) {
+            const rc: isize = @bitCast(linux.read(fd, resp_buf[total..].ptr, resp_buf.len - total));
+            if (rc <= 0) break;
+            total += @intCast(rc);
+        }
+        if (total == 0) return false;
+        const resp = resp_buf[0..total];
+
+        // Must be HTTP 200 with exit_code exactly 0
+        if (!std.mem.startsWith(u8, resp, "HTTP/1.1 200") and
+            !std.mem.startsWith(u8, resp, "HTTP/1.0 200")) return false;
+
+        const marker = "\"exit_code\":0";
+        const pos = std.mem.indexOf(u8, resp, marker) orelse return false;
+        const after = pos + marker.len;
+        return after >= resp.len or resp[after] < '0' or resp[after] > '9';
     }
 
     /// Verify a slot's VM is actually responsive by sending GET /vm to its

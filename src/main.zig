@@ -98,6 +98,7 @@ const CliArgs = struct {
     // Pool
     @"pool-size": ?[*:0]const u8 = null,
     @"pool-sock": [*:0]const u8 = "/tmp/flint-pool.sock",
+    @"ready-cmd": ?[*:0]const u8 = null,
 
     /// Try to match `flag` against all struct fields (as `--field-name`).
     /// For bool fields, sets to true. For pointer fields, consumes the next arg.
@@ -169,6 +170,9 @@ pub fn main(init: std.process.Init) !void {
             .vmstate_path = cli.@"vmstate-path",
             .mem_path = cli.@"mem-path",
             .disk_path = cli.disk,
+            .vsock_cid = cli.@"vsock-cid",
+            .vsock_uds = cli.@"vsock-uds",
+            .ready_cmd = cli.@"ready-cmd",
             .pool_sock = cli.@"pool-sock",
             .self_exe = self_exe,
             .jail_dir = cli.jail,

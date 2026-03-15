@@ -426,6 +426,45 @@ test "pool: expireVms kills expired slots" {
     try std.testing.expectEqual(pool_mod.SlotState.ready, pool.slots[3].state);
 }
 
+test "pool: healthCheck without ready_cmd promotes on socket probe" {
+    var pool = pool_mod.Pool.init(.{
+        .pool_size = 2,
+        .vmstate_path = "test.vmstate",
+        .mem_path = "test.mem",
+        .pool_sock = "/tmp/test-pool.sock",
+        .self_exe = "flint",
+        // no ready_cmd — should promote to ready on socket probe alone
+    });
+
+    // Slot 0 is .starting but has no real socket, so probeSocket fails → stays .starting
+    pool.slots[0].state = .starting;
+    pool.slots[0].pid = 99999;
+
+    pool.healthCheck();
+
+    // No real VM behind it, so probeSocket fails, stays .starting
+    try std.testing.expectEqual(pool_mod.SlotState.starting, pool.slots[0].state);
+}
+
+test "pool: healthCheck with ready_cmd requires both probes" {
+    var pool = pool_mod.Pool.init(.{
+        .pool_size = 2,
+        .vmstate_path = "test.vmstate",
+        .mem_path = "test.mem",
+        .pool_sock = "/tmp/test-pool.sock",
+        .self_exe = "flint",
+        .ready_cmd = "curl -sf localhost:3000/health",
+    });
+
+    // Slot 0 is .starting — without a real VM, both probes fail
+    pool.slots[0].state = .starting;
+    pool.slots[0].pid = 99999;
+
+    pool.healthCheck();
+
+    try std.testing.expectEqual(pool_mod.SlotState.starting, pool.slots[0].state);
+}
+
 test "pool: status counts" {
     var pool = pool_mod.Pool.init(.{
         .pool_size = 4,

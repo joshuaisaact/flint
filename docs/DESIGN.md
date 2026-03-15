@@ -186,7 +186,12 @@ Priority order optimized for AI agent code execution sandbox use case:
    and shutdown. Epoll-driven main loop with 1-second tick for maintenance:
    reap children, health check, respawn failures, expire timed-out leases.
    Acquire accepts optional `timeout_ms` for automatic VM expiration.
-   CLI: `--pool-size`, `--pool-sock`, `--vmstate-path`, `--mem-path`.
+   Configurable guest readiness probe (`--ready-cmd`) runs a command inside
+   the guest via sandbox/exec after the VMM is up — VMs only become acquirable
+   once both the VMM API and the guest app are healthy. Vsock forwarded to
+   children with per-VM UDS paths for sandbox API support in pool mode.
+   CLI: `--pool-size`, `--pool-sock`, `--vmstate-path`, `--mem-path`,
+   `--vsock-cid`, `--vsock-uds`, `--ready-cmd`.
 
 4. ~~**Seccomp + jailer**~~ -- DONE. In-process `--jail` flag: mount namespace +
    pivot_root for filesystem isolation, device node creation (/dev/kvm, /dev/net/tun),
