@@ -21,6 +21,7 @@ pub const SlotState = enum {
 pub const VmSlot = struct {
     state: SlotState = .empty,
     pid: linux.pid_t = 0,
+    deadline_ns: i128 = 0, // CLOCK_MONOTONIC nanos, 0 = no timeout
     sock_path_buf: [128]u8 = undefined,
     sock_path_len: u8 = 0,
 
@@ -55,6 +56,13 @@ pub const Config = struct {
     pool_sock: [*:0]const u8,
     self_exe: [*:0]const u8, // argv[0] for re-exec
 };
+
+/// Current monotonic time in nanoseconds via raw syscall.
+pub fn timestamp() i128 {
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(i128, ts.sec) * 1_000_000_000 + ts.nsec;
+}
 
 pub const Pool = struct {
     slots: [MAX_POOL_SIZE]VmSlot = [_]VmSlot{.{}} ** MAX_POOL_SIZE,
@@ -93,6 +101,7 @@ pub const Pool = struct {
 
         killSlot(slot);
         slot.state = .empty;
+        slot.deadline_ns = 0;
         log.info("released slot {}", .{id});
 
         // Immediately start a replacement
@@ -148,6 +157,21 @@ pub const Pool = struct {
                     self.slots[i].state = .ready;
                     log.info("slot {} ready (pid {})", .{ i, self.slots[i].pid });
                 }
+            }
+        }
+    }
+
+    /// Kill VMs that have exceeded their deadline.
+    pub fn expireVms(self: *Pool) void {
+        const now = timestamp();
+        for (0..self.config.pool_size) |i| {
+            const slot = &self.slots[i];
+            if (slot.state == .in_use and slot.deadline_ns > 0 and now >= slot.deadline_ns) {
+                log.warn("slot {} expired (pid {}), killing", .{ i, slot.pid });
+                killSlot(slot);
+                slot.state = .empty;
+                slot.deadline_ns = 0;
+                self.spawnVm(@intCast(i));
             }
         }
     }

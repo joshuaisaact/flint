@@ -374,6 +374,58 @@ test "pool: copyDisk creates identical copy" {
     try std.testing.expectEqualStrings(test_data, buf[0..total]);
 }
 
+test "pool: timestamp returns monotonic nanoseconds" {
+    const t1 = pool_mod.timestamp();
+    const ts = std.os.linux.timespec{ .sec = 0, .nsec = 1_000_000 }; // 1ms
+    _ = std.os.linux.nanosleep(&ts, null);
+    const t2 = pool_mod.timestamp();
+
+    try std.testing.expect(t2 > t1);
+    try std.testing.expect(t2 - t1 >= 1_000_000); // at least 1ms
+    try std.testing.expect(t2 - t1 < 1_000_000_000); // less than 1s
+}
+
+test "pool: expireVms kills expired slots" {
+    var pool = pool_mod.Pool.init(.{
+        .pool_size = 4,
+        .vmstate_path = "test.vmstate",
+        .mem_path = "test.mem",
+        .pool_sock = "/tmp/test-pool.sock",
+        .self_exe = "flint",
+    });
+
+    // in_use with deadline in the past -> should expire
+    pool.slots[0].state = .in_use;
+    pool.slots[0].deadline_ns = 1;
+
+    // in_use with no deadline -> should NOT expire
+    pool.slots[1].state = .in_use;
+    pool.slots[1].deadline_ns = 0;
+
+    // in_use with future deadline -> should NOT expire
+    pool.slots[2].state = .in_use;
+    pool.slots[2].deadline_ns = std.math.maxInt(i128);
+
+    // ready with past deadline -> should NOT expire (not in_use)
+    pool.slots[3].state = .ready;
+    pool.slots[3].deadline_ns = 1;
+
+    pool.expireVms();
+
+    // Slot 0: expired, killed, respawned (spawnVm with bogus exe -> .failed or .starting)
+    try std.testing.expect(pool.slots[0].state != .in_use);
+    try std.testing.expectEqual(@as(i128, 0), pool.slots[0].deadline_ns);
+
+    // Slot 1: no deadline, untouched
+    try std.testing.expectEqual(pool_mod.SlotState.in_use, pool.slots[1].state);
+
+    // Slot 2: future deadline, untouched
+    try std.testing.expectEqual(pool_mod.SlotState.in_use, pool.slots[2].state);
+
+    // Slot 3: not in_use, untouched
+    try std.testing.expectEqual(pool_mod.SlotState.ready, pool.slots[3].state);
+}
+
 test "pool: status counts" {
     var pool = pool_mod.Pool.init(.{
         .pool_size = 4,

@@ -183,7 +183,10 @@ Priority order optimized for AI agent code execution sandbox use case:
    on other filesystems). REST API for acquire/release/status on the pool socket.
    Process-per-VM isolation, eager replenishment on release (kill and replace, no
    recycling). Health check via socket probe. Disk copies cleaned up on release
-   and shutdown. CLI: `--pool-size`, `--pool-sock`, `--vmstate-path`, `--mem-path`.
+   and shutdown. Epoll-driven main loop with 1-second tick for maintenance:
+   reap children, health check, respawn failures, expire timed-out leases.
+   Acquire accepts optional `timeout_ms` for automatic VM expiration.
+   CLI: `--pool-size`, `--pool-sock`, `--vmstate-path`, `--mem-path`.
 
 4. ~~**Seccomp + jailer**~~ -- DONE. In-process `--jail` flag: mount namespace +
    pivot_root for filesystem isolation, device node creation (/dev/kvm, /dev/net/tun),

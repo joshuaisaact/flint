@@ -176,7 +176,7 @@ pub fn main(init: std.process.Init) !void {
             .jail_gid = cli.@"jail-gid",
         });
         defer pool.shutdown();
-        return pool_api.serve(&pool, init.io);
+        return pool_api.serve(&pool);
     }
 
     // Jail setup runs before anything else — after this, the process is
