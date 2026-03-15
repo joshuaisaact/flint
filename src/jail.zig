@@ -27,6 +27,9 @@ pub const Config = struct {
     cgroup: ?[*:0]const u8 = null,
     cpu_pct: u32 = 0, // 0 = no limit, 100 = 1 core, 200 = 2 cores
     memory_mib: u32 = 0, // 0 = no limit
+    io_mbps: u32 = 0, // 0 = no limit, applies to disk backing device
+    disk_major: u32 = 0, // block device major:minor for io.max
+    disk_minor: u32 = 0,
     need_tun: bool = false,
 };
 
@@ -120,6 +123,20 @@ fn setupCgroup(name: [*:0]const u8, config: Config) !void {
         const val = std.fmt.bufPrint(&val_buf, "{}", .{bytes}) catch return error.FormatFailed;
         try writeCgroupSetting(&path_buf, base_len, "/memory.max", val);
         log.info("cgroup memory.max: {} MiB", .{config.memory_mib});
+    }
+    if (config.io_mbps > 0) {
+        // cgroups v2 io.max format: "major:minor rbps=N wbps=N"
+        // This is coarser than virtio-level rate limiting — the guest sees
+        // I/O stalls rather than clean virtqueue backpressure. Good enough
+        // for controlled workloads; for multi-tenant SLA guarantees on I/O
+        // latency, virtio-blk/net token bucket rate limiters are needed.
+        var val_buf: [64]u8 = undefined;
+        const bps = @as(u64, config.io_mbps) * 1024 * 1024;
+        const val = std.fmt.bufPrint(&val_buf, "{}:{} rbps={} wbps={}", .{
+            config.disk_major, config.disk_minor, bps, bps,
+        }) catch return error.FormatFailed;
+        try writeCgroupSetting(&path_buf, base_len, "/io.max", val);
+        log.info("cgroup io.max: {} MB/s ({}:{})", .{ config.io_mbps, config.disk_major, config.disk_minor });
     }
 
     // Move current process into the cgroup

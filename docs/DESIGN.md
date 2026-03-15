@@ -196,7 +196,8 @@ Priority order optimized for AI agent code execution sandbox use case:
 4. ~~**Seccomp + jailer**~~ -- DONE. In-process `--jail` flag: mount namespace +
    pivot_root for filesystem isolation, device node creation (/dev/kvm, /dev/net/tun),
    cgroups v2 with enforced resource limits (`--jail-cpu` percentage, `--jail-memory`
-   MiB — writes cpu.max and memory.max), privilege drop (setuid/setgid), seccomp BPF filter
+   MiB, `--jail-io` MB/s — writes cpu.max, memory.max, io.max), privilege drop
+   (setuid/setgid), seccomp BPF filter
    (44 whitelisted syscalls, KILL_PROCESS default). `--seccomp-audit` mode for
    development (LOG instead of KILL). All file paths relative to jail root after
    pivot_root.
@@ -206,8 +207,14 @@ Priority order optimized for AI agent code execution sandbox use case:
    Host-side thin proxy in the post-boot API: POST /sandbox/exec, /sandbox/write,
    /sandbox/read. Length-prefixed JSON protocol with base64 binary encoding.
 
-6. **Rate limiters** -- throttle virtio-blk and virtio-net I/O to enforce resource limits
-   per sandbox instance.
+6. **Virtio-level rate limiters** -- token bucket throttling on virtio-blk and virtio-net
+   for per-device I/O shaping with clean virtqueue backpressure. Currently, I/O limits
+   are enforced via cgroups v2 `io.max` (`--jail-io`), which is coarser: the kernel
+   throttles all I/O from the VMM process and the guest sees stalls rather than
+   backpressure. This is sufficient for controlled workloads (AI agent pipelines,
+   internal tooling) but not for multi-tenant deployments with SLA guarantees on
+   I/O latency. Virtio-level rate limiters (~1500 lines in Firecracker) would be
+   needed for that.
 
 7. **Metrics / logging** -- structured telemetry for sandbox lifecycle, resource usage,
    and error tracking.

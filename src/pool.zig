@@ -59,6 +59,7 @@ pub const Config = struct {
     jail_cgroup: ?[*:0]const u8 = null,
     jail_cpu: ?[*:0]const u8 = null,
     jail_memory: ?[*:0]const u8 = null,
+    jail_io: ?[*:0]const u8 = null,
     pool_sock: [*:0]const u8,
     self_exe: [*:0]const u8, // argv[0] for re-exec
 };
@@ -349,6 +350,12 @@ pub const Pool = struct {
                 argv_buf[argc] = "--jail-memory";
                 argc += 1;
                 argv_buf[argc] = mem;
+                argc += 1;
+            }
+            if (self.config.jail_io) |io| {
+                argv_buf[argc] = "--jail-io";
+                argc += 1;
+                argv_buf[argc] = io;
                 argc += 1;
             }
         }

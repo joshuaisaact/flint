@@ -133,7 +133,7 @@ Flint uses defense in depth:
 1. **KVM hardware isolation** -- guest runs in a separate address space enforced by CPU virtualization
 2. **Seccomp BPF** -- VMM process limited to 44 syscalls with argument-level filtering (blocks CLONE_NEWUSER, AF_INET, PROT_EXEC)
 3. **Mount namespace + pivot_root** -- VMM sees only its jail directory
-4. **Cgroups v2** -- CPU and memory limits per VM (`--jail-cpu`, `--jail-memory`)
+4. **Cgroups v2** -- CPU, memory, and I/O bandwidth limits per VM (`--jail-cpu`, `--jail-memory`, `--jail-io`)
 5. **Privilege drop** -- VMM drops to unprivileged UID/GID after setup
 6. **Process-per-VM** -- pool VMs are separate processes, no shared mutable state
 7. **CPUID filtering** -- hides host features the VMM doesn't emulate (CET, SGX, WAITPKG)
