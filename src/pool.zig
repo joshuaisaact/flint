@@ -24,8 +24,23 @@ pub const VmSlot = struct {
     sock_path_buf: [128]u8 = undefined,
     sock_path_len: u8 = 0,
 
+    disk_path_buf: [128]u8 = undefined,
+    disk_path_len: u8 = 0,
+
     pub fn sockPath(self: *const VmSlot) []const u8 {
         return self.sock_path_buf[0..self.sock_path_len];
+    }
+
+    /// Remove the per-VM disk copy if one exists.
+    pub fn unlinkDisk(self: *VmSlot) void {
+        if (self.disk_path_len > 0) {
+            var path_z: [129]u8 = undefined;
+            const len = self.disk_path_len;
+            @memcpy(path_z[0..len], self.disk_path_buf[0..len]);
+            path_z[len] = 0;
+            _ = linux.unlink(@ptrCast(path_z[0..len :0]));
+            self.disk_path_len = 0;
+        }
     }
 };
 
@@ -161,6 +176,8 @@ pub const Pool = struct {
                 path_z[len] = 0;
                 _ = linux.unlink(@ptrCast(path_z[0..len :0]));
             }
+            // Unlink per-VM disk copy
+            self.slots[i].unlinkDisk();
         }
     }
 
@@ -171,6 +188,7 @@ pub const Pool = struct {
             _ = linux.waitpid(slot.pid, &wstatus, 0);
             slot.pid = 0;
         }
+        slot.unlinkDisk();
     }
 
     fn spawnVm(self: *Pool, id: u16) void {
@@ -217,9 +235,31 @@ pub const Pool = struct {
         argc += 1;
 
         if (self.config.disk_path) |dp| {
+            // Create per-VM disk copy for write isolation (FICLONE on btrfs/XFS,
+            // read/write fallback on ext4). Each VM gets its own CoW copy so
+            // concurrent VMs don't corrupt a shared base image.
+            const disk_path = std.fmt.bufPrint(&slot.disk_path_buf, "/tmp/flint-pool-vm-{}.disk", .{id}) catch {
+                slot.state = .failed;
+                return;
+            };
+            slot.disk_path_len = @intCast(disk_path.len);
+
+            var disk_z: [129]u8 = undefined;
+            @memcpy(disk_z[0..disk_path.len], disk_path);
+            disk_z[disk_path.len] = 0;
+
+            copyDisk(dp, @ptrCast(disk_z[0..disk_path.len :0])) catch |err| {
+                log.err("failed to copy disk for slot {}: {}", .{ id, err });
+                slot.disk_path_len = 0;
+                slot.state = .failed;
+                return;
+            };
+
             argv_buf[argc] = "--disk";
             argc += 1;
-            argv_buf[argc] = dp;
+            @memcpy(arg_strs[1][0..disk_path.len], disk_path);
+            arg_strs[1][disk_path.len] = 0;
+            argv_buf[argc] = @ptrCast(arg_strs[1][0..disk_path.len :0]);
             argc += 1;
         }
 
@@ -247,6 +287,7 @@ pub const Pool = struct {
         const fork_rc: isize = @bitCast(linux.fork());
         if (fork_rc < 0) {
             log.err("fork failed for slot {}: errno {}", .{ id, -fork_rc });
+            slot.unlinkDisk();
             slot.state = .failed;
             return;
         }
@@ -269,6 +310,46 @@ pub const Pool = struct {
         slot.pid = @intCast(fork_rc);
         slot.state = .starting;
         log.info("spawned slot {} (pid {})", .{ id, slot.pid });
+    }
+
+    /// Copy a disk image for per-VM isolation. Tries FICLONE (instant CoW
+    /// reflink on btrfs/XFS) first, falls back to a read/write copy.
+    pub fn copyDisk(src: [*:0]const u8, dst: [*:0]const u8) !void {
+        const FICLONE: u32 = 0x40049409;
+
+        const src_rc: isize = @bitCast(linux.open(src, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0));
+        if (src_rc < 0) return error.OpenFailed;
+        const src_fd: i32 = @intCast(src_rc);
+        defer _ = linux.close(src_fd);
+
+        const dst_rc: isize = @bitCast(linux.open(dst, .{
+            .ACCMODE = .WRONLY,
+            .CREAT = true,
+            .TRUNC = true,
+            .CLOEXEC = true,
+        }, 0o644));
+        if (dst_rc < 0) return error.CreateFailed;
+        const dst_fd: i32 = @intCast(dst_rc);
+        defer _ = linux.close(dst_fd);
+
+        // Try FICLONE (instant CoW on btrfs/XFS)
+        const clone_rc: isize = @bitCast(linux.ioctl(dst_fd, FICLONE, @as(usize, @intCast(src_fd))));
+        if (clone_rc == 0) return;
+
+        // Fallback: read/write copy
+        var buf: [64 * 1024]u8 = undefined;
+        while (true) {
+            const rrc: isize = @bitCast(linux.read(src_fd, &buf, buf.len));
+            if (rrc == 0) break;
+            if (rrc < 0) return error.CopyFailed;
+            const n: usize = @intCast(rrc);
+            var written: usize = 0;
+            while (written < n) {
+                const wrc: isize = @bitCast(linux.write(dst_fd, buf[written..].ptr, n - written));
+                if (wrc <= 0) return error.CopyFailed;
+                written += @intCast(wrc);
+            }
+        }
     }
 
     /// Verify a slot's VM is actually responsive by sending GET /vm to its

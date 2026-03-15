@@ -332,6 +332,48 @@ test "pool: acquire and release lifecycle" {
     try std.testing.expect(pool.acquire() == null);
 }
 
+test "pool: copyDisk creates identical copy" {
+    const linux = std.os.linux;
+    const test_data = "flint disk copy test data - 0123456789ABCDEF" ** 100;
+    const src: [*:0]const u8 = "/tmp/flint-test-copydisk-src";
+    const dst: [*:0]const u8 = "/tmp/flint-test-copydisk-dst";
+
+    defer _ = linux.unlink(src);
+    defer _ = linux.unlink(dst);
+
+    // Create source file with test data
+    const src_rc: isize = @bitCast(linux.open(src, .{
+        .ACCMODE = .WRONLY,
+        .CREAT = true,
+        .TRUNC = true,
+        .CLOEXEC = true,
+    }, 0o644));
+    try std.testing.expect(src_rc >= 0);
+    const src_fd: i32 = @intCast(src_rc);
+    _ = linux.write(src_fd, test_data.ptr, test_data.len);
+    _ = linux.close(src_fd);
+
+    // Copy
+    try pool_mod.Pool.copyDisk(src, dst);
+
+    // Verify copy matches original
+    const dst_rc: isize = @bitCast(linux.open(dst, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0));
+    try std.testing.expect(dst_rc >= 0);
+    const dst_fd: i32 = @intCast(dst_rc);
+    defer _ = linux.close(dst_fd);
+
+    var buf: [test_data.len]u8 = undefined;
+    var total: usize = 0;
+    while (total < buf.len) {
+        const rc: isize = @bitCast(linux.read(dst_fd, buf[total..].ptr, buf.len - total));
+        if (rc <= 0) break;
+        total += @intCast(rc);
+    }
+
+    try std.testing.expectEqual(test_data.len, total);
+    try std.testing.expectEqualStrings(test_data, buf[0..total]);
+}
+
 test "pool: status counts" {
     var pool = pool_mod.Pool.init(.{
         .pool_size = 4,

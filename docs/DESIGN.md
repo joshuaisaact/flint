@@ -178,10 +178,12 @@ Priority order optimized for AI agent code execution sandbox use case:
    VmRuntime struct with atomic pause via `kvm_run.immediate_exit`.
 
 3. ~~**VM pool / warm start**~~ -- DONE. `flint pool` mode: pool manager spawns child
-   Flint processes in `--restore` mode, each with its own API socket. REST API for
-   acquire/release/status on the pool socket. Process-per-VM isolation, eager
-   replenishment on release (kill and replace, no recycling). Health check via
-   socket probe. CLI: `--pool-size`, `--pool-sock`, `--vmstate-path`, `--mem-path`.
+   Flint processes in `--restore` mode, each with its own API socket and per-VM
+   disk copy (FICLONE reflink on btrfs/XFS for instant CoW, read/write fallback
+   on other filesystems). REST API for acquire/release/status on the pool socket.
+   Process-per-VM isolation, eager replenishment on release (kill and replace, no
+   recycling). Health check via socket probe. Disk copies cleaned up on release
+   and shutdown. CLI: `--pool-size`, `--pool-sock`, `--vmstate-path`, `--mem-path`.
 
 4. ~~**Seccomp + jailer**~~ -- DONE. In-process `--jail` flag: mount namespace +
    pivot_root for filesystem isolation, device node creation (/dev/kvm, /dev/net/tun),
