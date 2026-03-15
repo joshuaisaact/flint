@@ -87,9 +87,9 @@ flint pool --vmstate-path snap.vmstate --mem-path snap.mem --disk rootfs.img \
 
 # Acquire a VM, use it, release it
 curl -X POST --unix-socket /tmp/pool.sock http://localhost/pool/acquire \
-  -d '{"timeout_ms": 300000}'
+  -d '{"timeout_ms": 600000}'
 # {"id":0,"api_sock":"/tmp/flint-pool-vm-0.sock"}
-# VM auto-expires after 5 minutes if not released
+# Safety timeout — VM auto-recycles if the agent crashes without releasing
 
 curl -X POST --unix-socket /tmp/pool.sock http://localhost/pool/release \
   -d '{"id": 0}'
