@@ -59,7 +59,6 @@ const VsockBody = struct {
 const SnapshotLoadBody = struct {
     snapshot_path: []const u8,
     mem_file_path: []const u8,
-    resume_vm: bool = true,
 };
 
 const ActionBody = struct {
@@ -110,12 +109,11 @@ pub fn serve(sock_path: []const u8, io: Io, allocator: std.mem.Allocator) !VmCon
 
         if (started) {
             if (config.snapshot_path != null) {
-                log.info("snapshot/load received, restoring VM", .{});
+                log.info("InstanceStart received, restoring from snapshot", .{});
                 return config;
             }
-            // Validate we have minimum config for boot
             if (config.kernel_path == null) {
-                log.err("InstanceStart without kernel_image_path", .{});
+                log.err("InstanceStart without kernel_image_path or snapshot", .{});
                 continue;
             }
             log.info("InstanceStart received, booting VM", .{});
@@ -145,7 +143,7 @@ fn handleConnection(stream: Io.net.Stream, io: Io, allocator: std.mem.Allocator,
         const result = handleRequest(&request, allocator, config);
 
         switch (result) {
-            .instance_start, .snapshot_load => return true,
+            .instance_start => return true,
             .ok => {},
             .err => return false,
         }
@@ -154,7 +152,7 @@ fn handleConnection(stream: Io.net.Stream, io: Io, allocator: std.mem.Allocator,
     }
 }
 
-const RequestResult = enum { ok, instance_start, snapshot_load, err };
+const RequestResult = enum { ok, instance_start, err };
 
 /// Route and handle a single HTTP request.
 fn handleRequest(request: *http.Server.Request, allocator: std.mem.Allocator, config: *VmConfig) RequestResult {
@@ -407,11 +405,6 @@ fn handleSnapshotLoad(request: *http.Server.Request, body: ?[]const u8, allocato
     };
     defer parsed.deinit();
 
-    if (!parsed.value.resume_vm) {
-        respondError(request, .bad_request, "resume_vm=false is not yet supported");
-        return .ok;
-    }
-
     // Allocate both paths before assigning to config to avoid partial state on failure
     const sp = allocator.dupeZ(u8, parsed.value.snapshot_path) catch {
         respondError(request, .internal_server_error, "allocation failed");
@@ -427,7 +420,7 @@ fn handleSnapshotLoad(request: *http.Server.Request, body: ?[]const u8, allocato
     config.mem_file_path = mp;
 
     respondOk(request);
-    return .snapshot_load;
+    return .ok;
 }
 
 /// Read request body into buffer. Returns null if no body.
