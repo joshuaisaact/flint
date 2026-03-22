@@ -21,11 +21,27 @@ pub const SlotState = enum {
 pub const VmSlot = struct {
     state: SlotState = .empty,
     pid: linux.pid_t = 0,
+    deadline_ns: i128 = 0, // CLOCK_MONOTONIC nanos, 0 = no timeout
     sock_path_buf: [128]u8 = undefined,
     sock_path_len: u8 = 0,
 
+    disk_path_buf: [128]u8 = undefined,
+    disk_path_len: u8 = 0,
+
     pub fn sockPath(self: *const VmSlot) []const u8 {
         return self.sock_path_buf[0..self.sock_path_len];
+    }
+
+    /// Remove the per-VM disk copy if one exists.
+    pub fn unlinkDisk(self: *VmSlot) void {
+        if (self.disk_path_len > 0) {
+            var path_z: [129]u8 = undefined;
+            const len = self.disk_path_len;
+            @memcpy(path_z[0..len], self.disk_path_buf[0..len]);
+            path_z[len] = 0;
+            _ = linux.unlink(@ptrCast(path_z[0..len :0]));
+            self.disk_path_len = 0;
+        }
     }
 };
 
@@ -34,12 +50,26 @@ pub const Config = struct {
     vmstate_path: [*:0]const u8,
     mem_path: [*:0]const u8,
     disk_path: ?[*:0]const u8 = null,
+    vsock_cid: ?[*:0]const u8 = null,
+    vsock_uds: ?[*:0]const u8 = null,
+    ready_cmd: ?[*:0]const u8 = null,
     jail_dir: ?[*:0]const u8 = null,
     jail_uid: ?[*:0]const u8 = null,
     jail_gid: ?[*:0]const u8 = null,
+    jail_cgroup: ?[*:0]const u8 = null,
+    jail_cpu: ?[*:0]const u8 = null,
+    jail_memory: ?[*:0]const u8 = null,
+    jail_io: ?[*:0]const u8 = null,
     pool_sock: [*:0]const u8,
     self_exe: [*:0]const u8, // argv[0] for re-exec
 };
+
+/// Current monotonic time in nanoseconds via raw syscall.
+pub fn timestamp() i128 {
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(i128, ts.sec) * 1_000_000_000 + ts.nsec;
+}
 
 pub const Pool = struct {
     slots: [MAX_POOL_SIZE]VmSlot = [_]VmSlot{.{}} ** MAX_POOL_SIZE,
@@ -78,6 +108,7 @@ pub const Pool = struct {
 
         killSlot(slot);
         slot.state = .empty;
+        slot.deadline_ns = 0;
         log.info("released slot {}", .{id});
 
         // Immediately start a replacement
@@ -125,14 +156,32 @@ pub const Pool = struct {
         }
     }
 
-    /// Check STARTING slots by connecting to their API socket.
+    /// Check STARTING slots: first verify the VMM API is responsive,
+    /// then optionally run a guest readiness command via sandbox/exec.
     pub fn healthCheck(self: *Pool) void {
         for (0..self.config.pool_size) |i| {
             if (self.slots[i].state == .starting) {
-                if (probeSocket(&self.slots[i])) {
-                    self.slots[i].state = .ready;
-                    log.info("slot {} ready (pid {})", .{ i, self.slots[i].pid });
+                if (!probeSocket(&self.slots[i])) continue;
+                if (self.config.ready_cmd) |cmd| {
+                    if (!probeReady(&self.slots[i], cmd)) continue;
                 }
+                self.slots[i].state = .ready;
+                log.info("slot {} ready (pid {})", .{ i, self.slots[i].pid });
+            }
+        }
+    }
+
+    /// Kill VMs that have exceeded their deadline.
+    pub fn expireVms(self: *Pool) void {
+        const now = timestamp();
+        for (0..self.config.pool_size) |i| {
+            const slot = &self.slots[i];
+            if (slot.state == .in_use and slot.deadline_ns > 0 and now >= slot.deadline_ns) {
+                log.warn("slot {} expired (pid {}), killing", .{ i, slot.pid });
+                killSlot(slot);
+                slot.state = .empty;
+                slot.deadline_ns = 0;
+                self.spawnVm(@intCast(i));
             }
         }
     }
@@ -161,6 +210,8 @@ pub const Pool = struct {
                 path_z[len] = 0;
                 _ = linux.unlink(@ptrCast(path_z[0..len :0]));
             }
+            // Unlink per-VM disk copy
+            self.slots[i].unlinkDisk();
         }
     }
 
@@ -171,6 +222,7 @@ pub const Pool = struct {
             _ = linux.waitpid(slot.pid, &wstatus, 0);
             slot.pid = 0;
         }
+        slot.unlinkDisk();
     }
 
     fn spawnVm(self: *Pool, id: u16) void {
@@ -217,10 +269,52 @@ pub const Pool = struct {
         argc += 1;
 
         if (self.config.disk_path) |dp| {
+            // Create per-VM disk copy for write isolation (FICLONE on btrfs/XFS,
+            // read/write fallback on ext4). Each VM gets its own CoW copy so
+            // concurrent VMs don't corrupt a shared base image.
+            const disk_path = std.fmt.bufPrint(&slot.disk_path_buf, "/tmp/flint-pool-vm-{}.disk", .{id}) catch {
+                slot.state = .failed;
+                return;
+            };
+            slot.disk_path_len = @intCast(disk_path.len);
+
+            var disk_z: [129]u8 = undefined;
+            @memcpy(disk_z[0..disk_path.len], disk_path);
+            disk_z[disk_path.len] = 0;
+
+            copyDisk(dp, @ptrCast(disk_z[0..disk_path.len :0])) catch |err| {
+                log.err("failed to copy disk for slot {}: {}", .{ id, err });
+                slot.disk_path_len = 0;
+                slot.state = .failed;
+                return;
+            };
+
             argv_buf[argc] = "--disk";
             argc += 1;
-            argv_buf[argc] = dp;
+            @memcpy(arg_strs[1][0..disk_path.len], disk_path);
+            arg_strs[1][disk_path.len] = 0;
+            argv_buf[argc] = @ptrCast(arg_strs[1][0..disk_path.len :0]);
             argc += 1;
+        }
+
+        if (self.config.vsock_cid) |cid| {
+            if (self.config.vsock_uds) |uds| {
+                argv_buf[argc] = "--vsock-cid";
+                argc += 1;
+                argv_buf[argc] = cid;
+                argc += 1;
+                argv_buf[argc] = "--vsock-uds";
+                argc += 1;
+                // Per-VM vsock UDS path to avoid collisions between children
+                const uds_len = std.mem.indexOfSentinel(u8, 0, uds);
+                const vm_uds = std.fmt.bufPrint(&arg_strs[2], "{s}-vm-{}", .{ uds[0..uds_len], id }) catch {
+                    slot.state = .failed;
+                    return;
+                };
+                arg_strs[2][vm_uds.len] = 0;
+                argv_buf[argc] = @ptrCast(arg_strs[2][0..vm_uds.len :0]);
+                argc += 1;
+            }
         }
 
         if (self.config.jail_dir) |jd| {
@@ -240,6 +334,30 @@ pub const Pool = struct {
                 argv_buf[argc] = g;
                 argc += 1;
             }
+            if (self.config.jail_cgroup) |cg| {
+                argv_buf[argc] = "--jail-cgroup";
+                argc += 1;
+                argv_buf[argc] = cg;
+                argc += 1;
+            }
+            if (self.config.jail_cpu) |cpu| {
+                argv_buf[argc] = "--jail-cpu";
+                argc += 1;
+                argv_buf[argc] = cpu;
+                argc += 1;
+            }
+            if (self.config.jail_memory) |mem| {
+                argv_buf[argc] = "--jail-memory";
+                argc += 1;
+                argv_buf[argc] = mem;
+                argc += 1;
+            }
+            if (self.config.jail_io) |io| {
+                argv_buf[argc] = "--jail-io";
+                argc += 1;
+                argv_buf[argc] = io;
+                argc += 1;
+            }
         }
 
         argv_buf[argc] = null; // null-terminate argv
@@ -247,6 +365,7 @@ pub const Pool = struct {
         const fork_rc: isize = @bitCast(linux.fork());
         if (fork_rc < 0) {
             log.err("fork failed for slot {}: errno {}", .{ id, -fork_rc });
+            slot.unlinkDisk();
             slot.state = .failed;
             return;
         }
@@ -269,6 +388,117 @@ pub const Pool = struct {
         slot.pid = @intCast(fork_rc);
         slot.state = .starting;
         log.info("spawned slot {} (pid {})", .{ id, slot.pid });
+    }
+
+    /// Copy a disk image for per-VM isolation. Tries FICLONE (instant CoW
+    /// reflink on btrfs/XFS) first, falls back to a read/write copy.
+    pub fn copyDisk(src: [*:0]const u8, dst: [*:0]const u8) !void {
+        const FICLONE: u32 = 0x40049409;
+
+        const src_rc: isize = @bitCast(linux.open(src, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0));
+        if (src_rc < 0) return error.OpenFailed;
+        const src_fd: i32 = @intCast(src_rc);
+        defer _ = linux.close(src_fd);
+
+        const dst_rc: isize = @bitCast(linux.open(dst, .{
+            .ACCMODE = .WRONLY,
+            .CREAT = true,
+            .TRUNC = true,
+            .CLOEXEC = true,
+        }, 0o644));
+        if (dst_rc < 0) return error.CreateFailed;
+        const dst_fd: i32 = @intCast(dst_rc);
+        defer _ = linux.close(dst_fd);
+
+        // Try FICLONE (instant CoW on btrfs/XFS)
+        const clone_rc: isize = @bitCast(linux.ioctl(dst_fd, FICLONE, @as(usize, @intCast(src_fd))));
+        if (clone_rc == 0) return;
+
+        // Fallback: read/write copy
+        var buf: [64 * 1024]u8 = undefined;
+        while (true) {
+            const rrc: isize = @bitCast(linux.read(src_fd, &buf, buf.len));
+            if (rrc == 0) break;
+            if (rrc < 0) return error.CopyFailed;
+            const n: usize = @intCast(rrc);
+            var written: usize = 0;
+            while (written < n) {
+                const wrc: isize = @bitCast(linux.write(dst_fd, buf[written..].ptr, n - written));
+                if (wrc <= 0) return error.CopyFailed;
+                written += @intCast(wrc);
+            }
+        }
+    }
+
+    /// Run a readiness command inside the guest via POST /sandbox/exec.
+    /// Returns true only if the command exits with code 0.
+    fn probeReady(slot: *const VmSlot, ready_cmd: [*:0]const u8) bool {
+        const path = slot.sockPath();
+        if (path.len == 0) return false;
+
+        const sock_rc: isize = @bitCast(linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0));
+        if (sock_rc < 0) return false;
+        const fd: linux.fd_t = @intCast(sock_rc);
+        defer _ = linux.close(fd);
+
+        var addr: linux.sockaddr.un = .{ .family = linux.AF.UNIX, .path = undefined };
+        @memset(&addr.path, 0);
+        if (path.len > addr.path.len) return false;
+        for (0..path.len) |j| {
+            addr.path[j] = @intCast(path[j]);
+        }
+
+        const connect_rc: isize = @bitCast(linux.connect(
+            fd,
+            @ptrCast(&addr),
+            @intCast(@sizeOf(linux.sockaddr.un)),
+        ));
+        if (connect_rc < 0) return false;
+
+        // Build POST /sandbox/exec request
+        const cmd_len = std.mem.indexOfSentinel(u8, 0, ready_cmd);
+        var body_buf: [512]u8 = undefined;
+        const body = std.fmt.bufPrint(&body_buf, "{{\"cmd\":\"{s}\",\"timeout\":5}}", .{
+            ready_cmd[0..cmd_len],
+        }) catch return false;
+
+        var req_buf: [1024]u8 = undefined;
+        const req = std.fmt.bufPrint(&req_buf,
+            "POST /sandbox/exec HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{s}",
+            .{ body.len, body },
+        ) catch return false;
+
+        var written: usize = 0;
+        while (written < req.len) {
+            const rc: isize = @bitCast(linux.write(fd, req[written..].ptr, req.len - written));
+            if (rc <= 0) return false;
+            written += @intCast(rc);
+        }
+
+        // Wait for response with 10s timeout (ready_cmd has 5s guest timeout)
+        var pfd = linux.pollfd{ .fd = fd, .events = linux.POLL.IN, .revents = 0 };
+        const poll_rc: isize = @bitCast(linux.poll(@ptrCast(&pfd), 1, 10_000));
+        if (poll_rc <= 0) return false;
+
+        // Read until EOF (server sends Connection: close)
+        var resp_buf: [4096]u8 = undefined;
+        var total: usize = 0;
+        while (total < resp_buf.len) {
+            const rc: isize = @bitCast(linux.read(fd, resp_buf[total..].ptr, resp_buf.len - total));
+            if (rc <= 0) break;
+            total += @intCast(rc);
+        }
+        if (total == 0) return false;
+        const resp = resp_buf[0..total];
+
+        // Must be HTTP 200 with exit_code exactly 0
+        if (!std.mem.startsWith(u8, resp, "HTTP/1.1 200") and
+            !std.mem.startsWith(u8, resp, "HTTP/1.0 200")) return false;
+
+        const marker = "\"exit_code\":0";
+        const pos = std.mem.indexOf(u8, resp, marker) orelse return false;
+        const after = pos + marker.len;
+        return after >= resp.len or resp[after] < '0' or resp[after] > '9';
     }
 
     /// Verify a slot's VM is actually responsive by sending GET /vm to its

@@ -178,14 +178,26 @@ Priority order optimized for AI agent code execution sandbox use case:
    VmRuntime struct with atomic pause via `kvm_run.immediate_exit`.
 
 3. ~~**VM pool / warm start**~~ -- DONE. `flint pool` mode: pool manager spawns child
-   Flint processes in `--restore` mode, each with its own API socket. REST API for
-   acquire/release/status on the pool socket. Process-per-VM isolation, eager
-   replenishment on release (kill and replace, no recycling). Health check via
-   socket probe. CLI: `--pool-size`, `--pool-sock`, `--vmstate-path`, `--mem-path`.
+   Flint processes in `--restore` mode, each with its own API socket and per-VM
+   disk copy (FICLONE reflink on btrfs/XFS for instant CoW, read/write fallback
+   on other filesystems). REST API for acquire/release/status on the pool socket.
+   Process-per-VM isolation, eager replenishment on release (kill and replace, no
+   recycling). Health check via socket probe. Disk copies cleaned up on release
+   and shutdown. Epoll-driven main loop with 1-second tick for maintenance:
+   reap children, health check, respawn failures, expire timed-out leases.
+   Acquire accepts optional `timeout_ms` for automatic VM expiration.
+   Configurable guest readiness probe (`--ready-cmd`) runs a command inside
+   the guest via sandbox/exec after the VMM is up — VMs only become acquirable
+   once both the VMM API and the guest app are healthy. Vsock forwarded to
+   children with per-VM UDS paths for sandbox API support in pool mode.
+   CLI: `--pool-size`, `--pool-sock`, `--vmstate-path`, `--mem-path`,
+   `--vsock-cid`, `--vsock-uds`, `--ready-cmd`.
 
 4. ~~**Seccomp + jailer**~~ -- DONE. In-process `--jail` flag: mount namespace +
    pivot_root for filesystem isolation, device node creation (/dev/kvm, /dev/net/tun),
-   cgroups v2 for resource limits, privilege drop (setuid/setgid), seccomp BPF filter
+   cgroups v2 with enforced resource limits (`--jail-cpu` percentage, `--jail-memory`
+   MiB, `--jail-io` MB/s — writes cpu.max, memory.max, io.max), privilege drop
+   (setuid/setgid), seccomp BPF filter
    (44 whitelisted syscalls, KILL_PROCESS default). `--seccomp-audit` mode for
    development (LOG instead of KILL). All file paths relative to jail root after
    pivot_root.
@@ -195,8 +207,14 @@ Priority order optimized for AI agent code execution sandbox use case:
    Host-side thin proxy in the post-boot API: POST /sandbox/exec, /sandbox/write,
    /sandbox/read. Length-prefixed JSON protocol with base64 binary encoding.
 
-6. **Rate limiters** -- throttle virtio-blk and virtio-net I/O to enforce resource limits
-   per sandbox instance.
+6. **Virtio-level rate limiters** -- token bucket throttling on virtio-blk and virtio-net
+   for per-device I/O shaping with clean virtqueue backpressure. Currently, I/O limits
+   are enforced via cgroups v2 `io.max` (`--jail-io`), which is coarser: the kernel
+   throttles all I/O from the VMM process and the guest sees stalls rather than
+   backpressure. This is sufficient for controlled workloads (AI agent pipelines,
+   internal tooling) but not for multi-tenant deployments with SLA guarantees on
+   I/O latency. Virtio-level rate limiters (~1500 lines in Firecracker) would be
+   needed for that.
 
 7. **Metrics / logging** -- structured telemetry for sandbox lifecycle, resource usage,
    and error tracking.

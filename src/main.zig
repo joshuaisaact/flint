@@ -93,11 +93,15 @@ const CliArgs = struct {
     @"jail-uid": ?[*:0]const u8 = null,
     @"jail-gid": ?[*:0]const u8 = null,
     @"jail-cgroup": ?[*:0]const u8 = null,
+    @"jail-cpu": ?[*:0]const u8 = null,
+    @"jail-memory": ?[*:0]const u8 = null,
+    @"jail-io": ?[*:0]const u8 = null,
     @"seccomp-audit": bool = false,
 
     // Pool
     @"pool-size": ?[*:0]const u8 = null,
     @"pool-sock": [*:0]const u8 = "/tmp/flint-pool.sock",
+    @"ready-cmd": ?[*:0]const u8 = null,
 
     /// Try to match `flag` against all struct fields (as `--field-name`).
     /// For bool fields, sets to true. For pointer fields, consumes the next arg.
@@ -169,14 +173,21 @@ pub fn main(init: std.process.Init) !void {
             .vmstate_path = cli.@"vmstate-path",
             .mem_path = cli.@"mem-path",
             .disk_path = cli.disk,
+            .vsock_cid = cli.@"vsock-cid",
+            .vsock_uds = cli.@"vsock-uds",
+            .ready_cmd = cli.@"ready-cmd",
             .pool_sock = cli.@"pool-sock",
             .self_exe = self_exe,
             .jail_dir = cli.jail,
             .jail_uid = cli.@"jail-uid",
             .jail_gid = cli.@"jail-gid",
+            .jail_cgroup = cli.@"jail-cgroup",
+            .jail_cpu = cli.@"jail-cpu",
+            .jail_memory = cli.@"jail-memory",
+            .jail_io = cli.@"jail-io",
         });
         defer pool.shutdown();
-        return pool_api.serve(&pool, init.io);
+        return pool_api.serve(&pool);
     }
 
     // Jail setup runs before anything else — after this, the process is
@@ -205,11 +216,61 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("--jail-uid and --jail-gid must be non-zero (jail must drop root)\n", .{});
             std.process.exit(1);
         }
+        var cpu_pct: u32 = 0;
+        if (cli.@"jail-cpu") |s| {
+            const l = std.mem.indexOfSentinel(u8, 0, s);
+            cpu_pct = std.fmt.parseUnsigned(u32, s[0..l], 10) catch {
+                std.debug.print("invalid --jail-cpu\n", .{});
+                std.process.exit(1);
+            };
+        }
+        var memory_mib: u32 = 0;
+        if (cli.@"jail-memory") |s| {
+            const l = std.mem.indexOfSentinel(u8, 0, s);
+            memory_mib = std.fmt.parseUnsigned(u32, s[0..l], 10) catch {
+                std.debug.print("invalid --jail-memory\n", .{});
+                std.process.exit(1);
+            };
+        }
+        var io_mbps: u32 = 0;
+        var disk_major: u32 = 0;
+        var disk_minor: u32 = 0;
+        if (cli.@"jail-io") |s| {
+            const l = std.mem.indexOfSentinel(u8, 0, s);
+            io_mbps = std.fmt.parseUnsigned(u32, s[0..l], 10) catch {
+                std.debug.print("invalid --jail-io\n", .{});
+                std.process.exit(1);
+            };
+            // Resolve disk backing device major:minor via statx
+            if (cli.disk) |dp| {
+                var stx: std.os.linux.Statx = undefined;
+                const stat_rc: isize = @bitCast(std.os.linux.statx(
+                    @as(i32, -100), // AT_FDCWD
+                    dp,
+                    0,
+                    .{},
+                    &stx,
+                ));
+                if (stat_rc == 0) {
+                    disk_major = stx.dev_major;
+                    disk_minor = stx.dev_minor;
+                }
+            }
+            if (disk_major == 0 and disk_minor == 0) {
+                std.debug.print("--jail-io requires --disk (need device major:minor)\n", .{});
+                std.process.exit(1);
+            }
+        }
         try jail.setup(.{
             .jail_dir = jd,
             .uid = uid,
             .gid = gid,
             .cgroup = cli.@"jail-cgroup",
+            .cpu_pct = cpu_pct,
+            .memory_mib = memory_mib,
+            .io_mbps = io_mbps,
+            .disk_major = disk_major,
+            .disk_minor = disk_minor,
             .need_tun = cli.tap != null,
         });
     }
@@ -230,17 +291,29 @@ pub fn main(init: std.process.Init) !void {
         // Restore mode: rebuild VM from snapshot files, no kernel load
         try restoreVm(cli.@"vmstate-path", cli.@"mem-path", cli.disk, cli.tap, cli.@"vsock-cid", cli.@"vsock-uds");
     } else if (cli.@"api-sock") |sock| {
-        // API mode: pre-boot config phase, then boot, then post-boot API
+        // API mode: pre-boot config phase, then boot or restore, then post-boot API
         const sock_len = std.mem.indexOfSentinel(u8, 0, sock);
         const config = try api.serve(sock[0..sock_len], init.io, init.gpa);
-        const kp: [*:0]const u8 = config.kernel_path.?.ptr;
-        const ip: ?[*:0]const u8 = if (config.initrd_path) |p| p.ptr else null;
-        const ba: ?[*:0]const u8 = if (config.boot_args) |p| p.ptr else null;
-        const dp: ?[*:0]const u8 = if (config.disk_path) |p| p.ptr else null;
-        const tn: ?[*:0]const u8 = if (config.tap_name) |p| p.ptr else null;
-        const vc: ?[*:0]const u8 = if (config.vsock_cid) |p| p.ptr else null;
-        const vu: ?[*:0]const u8 = if (config.vsock_uds) |p| p.ptr else null;
-        try bootVmWithApi(kp, ip, ba, dp, tn, vc, vu, config.mem_size_mib, sock[0..sock_len], init.io, init.gpa);
+
+        if (config.snapshot_path) |sp| {
+            // Snapshot/load via API: restore from snapshot files
+            const mp: [*:0]const u8 = config.mem_file_path.?.ptr;
+            const dp: ?[*:0]const u8 = if (config.disk_path) |p| p.ptr else null;
+            const tn: ?[*:0]const u8 = if (config.tap_name) |p| p.ptr else null;
+            const vc: ?[*:0]const u8 = if (config.vsock_cid) |p| p.ptr else null;
+            const vu: ?[*:0]const u8 = if (config.vsock_uds) |p| p.ptr else null;
+            try restoreVmWithApi(sp.ptr, mp, dp, tn, vc, vu, sock[0..sock_len], init.io, init.gpa);
+        } else {
+            // Boot via API
+            const kp: [*:0]const u8 = config.kernel_path.?.ptr;
+            const ip: ?[*:0]const u8 = if (config.initrd_path) |p| p.ptr else null;
+            const ba: ?[*:0]const u8 = if (config.boot_args) |p| p.ptr else null;
+            const dp: ?[*:0]const u8 = if (config.disk_path) |p| p.ptr else null;
+            const tn: ?[*:0]const u8 = if (config.tap_name) |p| p.ptr else null;
+            const vc: ?[*:0]const u8 = if (config.vsock_cid) |p| p.ptr else null;
+            const vu: ?[*:0]const u8 = if (config.vsock_uds) |p| p.ptr else null;
+            try bootVmWithApi(kp, ip, ba, dp, tn, vc, vu, config.mem_size_mib, sock[0..sock_len], init.io, init.gpa);
+        }
     } else if (kernel_path) |kp| {
         // CLI mode: boot directly from args
         const snap_opts: SnapshotOpts = if (cli.@"save-on-halt") .{
@@ -253,6 +326,7 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("       flint --restore [--vmstate-path <path>] [--mem-path <path>]\n", .{});
         std.debug.print("       flint --api-sock <path>\n", .{});
         std.debug.print("       --jail <dir> --jail-uid <uid> --jail-gid <gid> [--jail-cgroup <name>]\n", .{});
+        std.debug.print("         [--jail-cpu <pct>] [--jail-memory <MiB>] [--jail-io <MB/s>]\n", .{});
         std.debug.print("       --seccomp-audit  (log violations instead of killing)\n", .{});
         std.debug.print("       flint pool --vmstate-path <p> --mem-path <p> --pool-size <n> --pool-sock <p>\n", .{});
         std.process.exit(1);

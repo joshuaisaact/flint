@@ -23,6 +23,8 @@ pub const VmConfig = struct {
     vsock_cid: ?[:0]const u8 = null,
     vsock_uds: ?[:0]const u8 = null,
     mem_size_mib: u32 = 512,
+    snapshot_path: ?[:0]const u8 = null,
+    mem_file_path: ?[:0]const u8 = null,
 };
 
 // JSON request body types
@@ -52,6 +54,11 @@ const MachineConfigBody = struct {
 const VsockBody = struct {
     guest_cid: u64,
     uds_path: []const u8,
+};
+
+const SnapshotLoadBody = struct {
+    snapshot_path: []const u8,
+    mem_file_path: []const u8,
 };
 
 const ActionBody = struct {
@@ -101,9 +108,12 @@ pub fn serve(sock_path: []const u8, io: Io, allocator: std.mem.Allocator) !VmCon
         stream.close(io);
 
         if (started) {
-            // Validate we have minimum config
+            if (config.snapshot_path != null) {
+                log.info("InstanceStart received, restoring from snapshot", .{});
+                return config;
+            }
             if (config.kernel_path == null) {
-                log.err("InstanceStart without kernel_image_path", .{});
+                log.err("InstanceStart without kernel_image_path or snapshot", .{});
                 continue;
             }
             log.info("InstanceStart received, booting VM", .{});
@@ -174,6 +184,8 @@ fn handleRequest(request: *http.Server.Request, allocator: std.mem.Allocator, co
         return handleGetMachineConfig(request, config);
     } else if (method == .PUT and std.mem.eql(u8, target, "/actions")) {
         return handleAction(request, body);
+    } else if (method == .PUT and std.mem.eql(u8, target, "/snapshot/load")) {
+        return handleSnapshotLoad(request, body, allocator, config);
     } else {
         respondError(request, .not_found, "resource not found");
         return .ok;
@@ -377,6 +389,38 @@ fn handleAction(request: *http.Server.Request, body: ?[]const u8) RequestResult 
         respondError(request, .bad_request, "unknown action_type");
         return .ok;
     }
+}
+
+fn handleSnapshotLoad(request: *http.Server.Request, body: ?[]const u8, allocator: std.mem.Allocator, config: *VmConfig) RequestResult {
+    const data = body orelse {
+        respondError(request, .bad_request, "missing request body");
+        return .ok;
+    };
+
+    const parsed = json.parseFromSlice(SnapshotLoadBody, allocator, data, .{
+        .ignore_unknown_fields = true,
+    }) catch {
+        respondError(request, .bad_request, "invalid JSON");
+        return .ok;
+    };
+    defer parsed.deinit();
+
+    // Allocate both paths before assigning to config to avoid partial state on failure
+    const sp = allocator.dupeZ(u8, parsed.value.snapshot_path) catch {
+        respondError(request, .internal_server_error, "allocation failed");
+        return .err;
+    };
+    const mp = allocator.dupeZ(u8, parsed.value.mem_file_path) catch {
+        allocator.free(sp);
+        respondError(request, .internal_server_error, "allocation failed");
+        return .err;
+    };
+
+    config.snapshot_path = sp;
+    config.mem_file_path = mp;
+
+    respondOk(request);
+    return .ok;
 }
 
 /// Read request body into buffer. Returns null if no body.

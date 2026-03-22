@@ -20,7 +20,7 @@ flint-agent (inside VM) --> fork+exec --> user command
 
 - **Fast boot**: ~84ms to userspace with a minimal kernel (or ~650ms with a stock distro kernel)
 - **Snapshot restore**: Save/restore full VM state in ~10ms (demand-paged via MAP_PRIVATE mmap)
-- **VM pool**: Pre-warm pool of snapshot-restored VMs with acquire/release API and HTTP health checks
+- **VM pool**: Pre-warm pool of snapshot-restored VMs with acquire/release API, per-VM disk CoW isolation, configurable guest readiness probes, VM lifetime timeouts, and automatic slot recycling
 - **Sandbox API**: Execute commands, upload/download files inside VMs via REST, graceful shutdown
 - **Epoll-based I/O**: Device fd polling via epoll instead of blind polling, vsock write backpressure buffering
 - **virtio devices**: virtio-blk (disk), virtio-net (TAP networking), virtio-vsock (host communication)
@@ -81,13 +81,17 @@ flint --restore --vmstate-path snap.vmstate --mem-path snap.mem --api-sock /tmp/
 ### VM pool (warm start)
 
 ```bash
-# Start a pool of 4 pre-restored VMs
-flint pool --vmstate-path snap.vmstate --mem-path snap.mem \
+# Start a pool of 4 pre-restored VMs (with per-VM disk isolation)
+flint pool --vmstate-path snap.vmstate --mem-path snap.mem --disk rootfs.img \
+  --vsock-cid 3 --vsock-uds /tmp/flint-vsock \
+  --ready-cmd 'curl -sf localhost:3000/health' \
   --pool-size 4 --pool-sock /tmp/pool.sock
 
 # Acquire a VM, use it, release it
-curl -X POST --unix-socket /tmp/pool.sock http://localhost/pool/acquire
+curl -X POST --unix-socket /tmp/pool.sock http://localhost/pool/acquire \
+  -d '{"timeout_ms": 600000}'
 # {"id":0,"api_sock":"/tmp/flint-pool-vm-0.sock"}
+# Safety timeout — VM auto-recycles if the agent crashes without releasing
 
 curl -X POST --unix-socket /tmp/pool.sock http://localhost/pool/release \
   -d '{"id": 0}'
@@ -129,7 +133,7 @@ Flint uses defense in depth:
 1. **KVM hardware isolation** -- guest runs in a separate address space enforced by CPU virtualization
 2. **Seccomp BPF** -- VMM process limited to 44 syscalls with argument-level filtering (blocks CLONE_NEWUSER, AF_INET, PROT_EXEC)
 3. **Mount namespace + pivot_root** -- VMM sees only its jail directory
-4. **Cgroups v2** -- CPU and memory limits per VM
+4. **Cgroups v2** -- CPU, memory, and I/O bandwidth limits per VM (`--jail-cpu`, `--jail-memory`, `--jail-io`)
 5. **Privilege drop** -- VMM drops to unprivileged UID/GID after setup
 6. **Process-per-VM** -- pool VMs are separate processes, no shared mutable state
 7. **CPUID filtering** -- hides host features the VMM doesn't emulate (CET, SGX, WAITPKG)

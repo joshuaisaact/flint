@@ -25,6 +25,11 @@ pub const Config = struct {
     uid: u32,
     gid: u32,
     cgroup: ?[*:0]const u8 = null,
+    cpu_pct: u32 = 0, // 0 = no limit, 100 = 1 core, 200 = 2 cores
+    memory_mib: u32 = 0, // 0 = no limit
+    io_mbps: u32 = 0, // 0 = no limit, applies to disk backing device
+    disk_major: u32 = 0, // block device major:minor for io.max
+    disk_minor: u32 = 0,
     need_tun: bool = false,
 };
 
@@ -34,7 +39,7 @@ pub fn setup(config: Config) !void {
 
     // Cgroup: move process into cgroup before pivot_root (needs /sys/fs/cgroup)
     if (config.cgroup) |cg| {
-        try setupCgroup(cg);
+        try setupCgroup(cg, config);
     }
 
     // New mount namespace — isolates our mount table from the host
@@ -78,7 +83,7 @@ pub fn setup(config: Config) !void {
     log.info("jail active: uid={} gid={}", .{ config.uid, config.gid });
 }
 
-fn setupCgroup(name: [*:0]const u8) !void {
+fn setupCgroup(name: [*:0]const u8, config: Config) !void {
     const name_len = std.mem.indexOfSentinel(u8, 0, name);
     const name_slice = name[0..name_len];
 
@@ -93,29 +98,60 @@ fn setupCgroup(name: [*:0]const u8) !void {
     const prefix = "/sys/fs/cgroup/";
 
     var path_buf: [256]u8 = undefined;
-    if (prefix.len + name_len >= path_buf.len) return error.CgroupPathTooLong;
+    const base_len = prefix.len + name_len;
+    if (base_len >= path_buf.len - 20) return error.CgroupPathTooLong;
     @memcpy(path_buf[0..prefix.len], prefix);
-    @memcpy(path_buf[prefix.len..][0..name_len], name[0..name_len]);
-    path_buf[prefix.len + name_len] = 0;
-    const cg_path: [*:0]const u8 = @ptrCast(path_buf[0 .. prefix.len + name_len :0]);
+    @memcpy(path_buf[prefix.len..][0..name_len], name_slice);
+    path_buf[base_len] = 0;
 
     // Create cgroup directory (may already exist)
-    _ = linux.mkdir(cg_path, 0o755);
+    _ = linux.mkdir(@ptrCast(path_buf[0..base_len :0]), 0o755);
+
+    // Set resource limits before moving process into cgroup.
+    // Requires cpu and memory controllers enabled in parent's
+    // cgroup.subtree_control (e.g. echo '+cpu +memory' > /sys/fs/cgroup/cgroup.subtree_control)
+    if (config.cpu_pct > 0) {
+        var val_buf: [32]u8 = undefined;
+        const quota = @as(u64, config.cpu_pct) * 1000; // period = 100000us
+        const val = std.fmt.bufPrint(&val_buf, "{} 100000", .{quota}) catch return error.FormatFailed;
+        try writeCgroupSetting(&path_buf, base_len, "/cpu.max", val);
+        log.info("cgroup cpu.max: {s}", .{val});
+    }
+    if (config.memory_mib > 0) {
+        var val_buf: [20]u8 = undefined;
+        const bytes = @as(u64, config.memory_mib) * 1024 * 1024;
+        const val = std.fmt.bufPrint(&val_buf, "{}", .{bytes}) catch return error.FormatFailed;
+        try writeCgroupSetting(&path_buf, base_len, "/memory.max", val);
+        log.info("cgroup memory.max: {} MiB", .{config.memory_mib});
+    }
+    if (config.io_mbps > 0) {
+        // cgroups v2 io.max format: "major:minor rbps=N wbps=N"
+        // This is coarser than virtio-level rate limiting — the guest sees
+        // I/O stalls rather than clean virtqueue backpressure. Good enough
+        // for controlled workloads; for multi-tenant SLA guarantees on I/O
+        // latency, virtio-blk/net token bucket rate limiters are needed.
+        var val_buf: [64]u8 = undefined;
+        const bps = @as(u64, config.io_mbps) * 1024 * 1024;
+        const val = std.fmt.bufPrint(&val_buf, "{}:{} rbps={} wbps={}", .{
+            config.disk_major, config.disk_minor, bps, bps,
+        }) catch return error.FormatFailed;
+        try writeCgroupSetting(&path_buf, base_len, "/io.max", val);
+        log.info("cgroup io.max: {} MB/s ({}:{})", .{ config.io_mbps, config.disk_major, config.disk_minor });
+    }
 
     // Move current process into the cgroup
-    const procs_suffix = "/cgroup.procs";
-    var procs_buf: [280]u8 = undefined;
-    const procs_len = prefix.len + name_len + procs_suffix.len;
-    @memcpy(procs_buf[0 .. prefix.len + name_len], path_buf[0 .. prefix.len + name_len]);
-    @memcpy(procs_buf[prefix.len + name_len ..][0..procs_suffix.len], procs_suffix);
-    procs_buf[procs_len] = 0;
-
     var pid_buf: [20]u8 = undefined;
     const pid: u64 = @intCast(linux.getpid());
     const pid_str = std.fmt.bufPrint(&pid_buf, "{}", .{pid}) catch return error.FormatFailed;
+    try writeCgroupSetting(&path_buf, base_len, "/cgroup.procs", pid_str);
+    log.info("joined cgroup: {s}", .{name_slice});
+}
 
-    try writeFile(@ptrCast(procs_buf[0..procs_len :0]), pid_str);
-    log.info("joined cgroup: {s}", .{name});
+fn writeCgroupSetting(path_buf: *[256]u8, base_len: usize, comptime suffix: []const u8, data: []const u8) !void {
+    @memcpy(path_buf[base_len..][0..suffix.len], suffix);
+    path_buf[base_len + suffix.len] = 0;
+    try writeFile(@ptrCast(path_buf[0 .. base_len + suffix.len :0]), data);
+    path_buf[base_len] = 0; // restore null terminator
 }
 
 fn writeFile(path: [*:0]const u8, data: []const u8) !void {
