@@ -23,6 +23,8 @@ pub const VmConfig = struct {
     vsock_cid: ?[:0]const u8 = null,
     vsock_uds: ?[:0]const u8 = null,
     mem_size_mib: u32 = 512,
+    snapshot_path: ?[:0]const u8 = null,
+    mem_file_path: ?[:0]const u8 = null,
 };
 
 // JSON request body types
@@ -52,6 +54,12 @@ const MachineConfigBody = struct {
 const VsockBody = struct {
     guest_cid: u64,
     uds_path: []const u8,
+};
+
+const SnapshotLoadBody = struct {
+    snapshot_path: []const u8,
+    mem_file_path: ?[]const u8 = null,
+    resume_vm: bool = true,
 };
 
 const ActionBody = struct {
@@ -101,7 +109,11 @@ pub fn serve(sock_path: []const u8, io: Io, allocator: std.mem.Allocator) !VmCon
         stream.close(io);
 
         if (started) {
-            // Validate we have minimum config
+            if (config.snapshot_path != null) {
+                log.info("snapshot/load received, restoring VM", .{});
+                return config;
+            }
+            // Validate we have minimum config for boot
             if (config.kernel_path == null) {
                 log.err("InstanceStart without kernel_image_path", .{});
                 continue;
@@ -133,7 +145,7 @@ fn handleConnection(stream: Io.net.Stream, io: Io, allocator: std.mem.Allocator,
         const result = handleRequest(&request, allocator, config);
 
         switch (result) {
-            .instance_start => return true,
+            .instance_start, .snapshot_load => return true,
             .ok => {},
             .err => return false,
         }
@@ -142,7 +154,7 @@ fn handleConnection(stream: Io.net.Stream, io: Io, allocator: std.mem.Allocator,
     }
 }
 
-const RequestResult = enum { ok, instance_start, err };
+const RequestResult = enum { ok, instance_start, snapshot_load, err };
 
 /// Route and handle a single HTTP request.
 fn handleRequest(request: *http.Server.Request, allocator: std.mem.Allocator, config: *VmConfig) RequestResult {
@@ -174,6 +186,8 @@ fn handleRequest(request: *http.Server.Request, allocator: std.mem.Allocator, co
         return handleGetMachineConfig(request, config);
     } else if (method == .PUT and std.mem.eql(u8, target, "/actions")) {
         return handleAction(request, body);
+    } else if (method == .PUT and std.mem.eql(u8, target, "/snapshot/load")) {
+        return handleSnapshotLoad(request, body, allocator, config);
     } else {
         respondError(request, .not_found, "resource not found");
         return .ok;
@@ -377,6 +391,41 @@ fn handleAction(request: *http.Server.Request, body: ?[]const u8) RequestResult 
         respondError(request, .bad_request, "unknown action_type");
         return .ok;
     }
+}
+
+fn handleSnapshotLoad(request: *http.Server.Request, body: ?[]const u8, allocator: std.mem.Allocator, config: *VmConfig) RequestResult {
+    const data = body orelse {
+        respondError(request, .bad_request, "missing request body");
+        return .ok;
+    };
+
+    const parsed = json.parseFromSlice(SnapshotLoadBody, allocator, data, .{
+        .ignore_unknown_fields = true,
+    }) catch {
+        respondError(request, .bad_request, "invalid JSON");
+        return .ok;
+    };
+    defer parsed.deinit();
+
+    if (!parsed.value.resume_vm) {
+        respondError(request, .bad_request, "resume_vm=false is not yet supported");
+        return .ok;
+    }
+
+    config.snapshot_path = allocator.dupeZ(u8, parsed.value.snapshot_path) catch {
+        respondError(request, .internal_server_error, "allocation failed");
+        return .err;
+    };
+
+    if (parsed.value.mem_file_path) |p| {
+        config.mem_file_path = allocator.dupeZ(u8, p) catch {
+            respondError(request, .internal_server_error, "allocation failed");
+            return .err;
+        };
+    }
+
+    respondOk(request);
+    return .snapshot_load;
 }
 
 /// Read request body into buffer. Returns null if no body.

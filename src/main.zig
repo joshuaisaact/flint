@@ -291,17 +291,29 @@ pub fn main(init: std.process.Init) !void {
         // Restore mode: rebuild VM from snapshot files, no kernel load
         try restoreVm(cli.@"vmstate-path", cli.@"mem-path", cli.disk, cli.tap, cli.@"vsock-cid", cli.@"vsock-uds");
     } else if (cli.@"api-sock") |sock| {
-        // API mode: pre-boot config phase, then boot, then post-boot API
+        // API mode: pre-boot config phase, then boot or restore, then post-boot API
         const sock_len = std.mem.indexOfSentinel(u8, 0, sock);
         const config = try api.serve(sock[0..sock_len], init.io, init.gpa);
-        const kp: [*:0]const u8 = config.kernel_path.?.ptr;
-        const ip: ?[*:0]const u8 = if (config.initrd_path) |p| p.ptr else null;
-        const ba: ?[*:0]const u8 = if (config.boot_args) |p| p.ptr else null;
-        const dp: ?[*:0]const u8 = if (config.disk_path) |p| p.ptr else null;
-        const tn: ?[*:0]const u8 = if (config.tap_name) |p| p.ptr else null;
-        const vc: ?[*:0]const u8 = if (config.vsock_cid) |p| p.ptr else null;
-        const vu: ?[*:0]const u8 = if (config.vsock_uds) |p| p.ptr else null;
-        try bootVmWithApi(kp, ip, ba, dp, tn, vc, vu, config.mem_size_mib, sock[0..sock_len], init.io, init.gpa);
+
+        if (config.snapshot_path) |sp| {
+            // Snapshot/load via API: restore from snapshot files
+            const mp: [*:0]const u8 = if (config.mem_file_path) |p| p.ptr else "snapshot.mem";
+            const dp: ?[*:0]const u8 = if (config.disk_path) |p| p.ptr else null;
+            const tn: ?[*:0]const u8 = if (config.tap_name) |p| p.ptr else null;
+            const vc: ?[*:0]const u8 = if (config.vsock_cid) |p| p.ptr else null;
+            const vu: ?[*:0]const u8 = if (config.vsock_uds) |p| p.ptr else null;
+            try restoreVmWithApi(sp.ptr, mp, dp, tn, vc, vu, sock[0..sock_len], init.io, init.gpa);
+        } else {
+            // Boot via API
+            const kp: [*:0]const u8 = config.kernel_path.?.ptr;
+            const ip: ?[*:0]const u8 = if (config.initrd_path) |p| p.ptr else null;
+            const ba: ?[*:0]const u8 = if (config.boot_args) |p| p.ptr else null;
+            const dp: ?[*:0]const u8 = if (config.disk_path) |p| p.ptr else null;
+            const tn: ?[*:0]const u8 = if (config.tap_name) |p| p.ptr else null;
+            const vc: ?[*:0]const u8 = if (config.vsock_cid) |p| p.ptr else null;
+            const vu: ?[*:0]const u8 = if (config.vsock_uds) |p| p.ptr else null;
+            try bootVmWithApi(kp, ip, ba, dp, tn, vc, vu, config.mem_size_mib, sock[0..sock_len], init.io, init.gpa);
+        }
     } else if (kernel_path) |kp| {
         // CLI mode: boot directly from args
         const snap_opts: SnapshotOpts = if (cli.@"save-on-halt") .{
