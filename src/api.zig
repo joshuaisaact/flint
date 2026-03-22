@@ -58,7 +58,7 @@ const VsockBody = struct {
 
 const SnapshotLoadBody = struct {
     snapshot_path: []const u8,
-    mem_file_path: ?[]const u8 = null,
+    mem_file_path: []const u8,
     resume_vm: bool = true,
 };
 
@@ -412,17 +412,19 @@ fn handleSnapshotLoad(request: *http.Server.Request, body: ?[]const u8, allocato
         return .ok;
     }
 
-    config.snapshot_path = allocator.dupeZ(u8, parsed.value.snapshot_path) catch {
+    // Allocate both paths before assigning to config to avoid partial state on failure
+    const sp = allocator.dupeZ(u8, parsed.value.snapshot_path) catch {
+        respondError(request, .internal_server_error, "allocation failed");
+        return .err;
+    };
+    const mp = allocator.dupeZ(u8, parsed.value.mem_file_path) catch {
+        allocator.free(sp);
         respondError(request, .internal_server_error, "allocation failed");
         return .err;
     };
 
-    if (parsed.value.mem_file_path) |p| {
-        config.mem_file_path = allocator.dupeZ(u8, p) catch {
-            respondError(request, .internal_server_error, "allocation failed");
-            return .err;
-        };
-    }
+    config.snapshot_path = sp;
+    config.mem_file_path = mp;
 
     respondOk(request);
     return .snapshot_load;

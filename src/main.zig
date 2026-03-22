@@ -297,7 +297,7 @@ pub fn main(init: std.process.Init) !void {
 
         if (config.snapshot_path) |sp| {
             // Snapshot/load via API: restore from snapshot files
-            const mp: [*:0]const u8 = if (config.mem_file_path) |p| p.ptr else "snapshot.mem";
+            const mp: [*:0]const u8 = config.mem_file_path.?.ptr;
             const dp: ?[*:0]const u8 = if (config.disk_path) |p| p.ptr else null;
             const tn: ?[*:0]const u8 = if (config.tap_name) |p| p.ptr else null;
             const vc: ?[*:0]const u8 = if (config.vsock_cid) |p| p.ptr else null;
